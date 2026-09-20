@@ -1,0 +1,2394 @@
+/*
+   ============================================================
+   VAULT OS 0.7
+   ESP32-C3 + OLED 128x64 + 4 buttons
+   ============================================================
+
+   BUTTONS
+   R5 = LEFT  / CHARSET-
+   R6 = RIGHT / CHARSET+
+   R7 = ENTER / ACCEPT
+   R8 = BACK  / DELETE
+
+   PINS
+   SDA = GPIO 8
+   SCL = GPIO 9
+   R5  = GPIO 3
+   R6  = GPIO 4
+   R7  = GPIO 5
+   R8  = GPIO 6
+
+   ============================================================
+   CHANGES v0.7
+   ============================================================
+
+   FIXED
+   - web lock no longer freezes WebServer
+   - loopTask stack raised to 16K (was causing reboot
+     after web unlock due to PBKDF2 + WebServer)
+   - device master-password entry now supports
+     cursor left/right, not only append/backspace
+   - settings / change-master / search / generator
+     rewritten and actually reachable
+   - all temp Strings removed from 20ms draw loop
+   - MAX_RECORDS lowered to 16 to reduce heap pressure
+
+   DEVICE KEYBOARD
+   R5 short  = prev char
+   R5 long   = prev charset
+   R6 short  = next char
+   R6 long   = next charset
+   R7 short  = insert char
+   R7 long   = accept / next field
+   R8 short  = delete char (backspace at cursor)
+   R8 long   = cancel
+
+   SECURITY (unchanged from v0.6)
+   - AES-256-CBC + HMAC-SHA256 Encrypt-then-MAC
+   - PBKDF2-HMAC-SHA256 -> 64 bytes
+   - MAC verified BEFORE decrypting
+   - random salt in header, random IV per save
+   - atomic writes via .tmp + rename
+   - failed password backoff
+   - session cookie + CSRF
+   - HTML escaping
+   - random AP password
+   - sensitive RAM wiped where practical
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <LittleFS.h>
+
+#include <mbedtls/aes.h>
+#include <mbedtls/md.h>
+#include <mbedtls/pkcs5.h>
+
+#include <esp_system.h>
+
+// ============================================================
+// HARDWARE
+// ============================================================
+
+#define PIN_SDA 8
+#define PIN_SCL 9
+
+#define PIN_R5 3
+#define PIN_R6 4
+#define PIN_R7 5
+#define PIN_R8 6
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(
+  U8G2_R0,
+  U8X8_PIN_NONE
+);
+
+WebServer server(80);
+
+// ============================================================
+// LIMITS
+// ============================================================
+
+#define MAX_RECORDS 16
+
+#define MAX_NAME 48
+#define MAX_USER 64
+#define MAX_PASS 96
+#define MAX_NOTE 128
+
+#define MAX_EDITOR 64
+
+#define VAULT_FILE "/vault.bin"
+#define VAULT_TMP  "/vault.tmp"
+
+#define CONFIG_FILE "/config.bin"
+#define CONFIG_TMP  "/config.tmp"
+
+#define VAULT_MAGIC   0x564C5437UL
+#define VAULT_VERSION 7
+
+#define CONFIG_MAGIC  0x43464737UL
+#define CONFIG_VERSION 7
+
+#define PBKDF2_ITERATIONS 20000
+
+#define SALT_SIZE 16
+#define IV_SIZE 16
+#define AES_KEY_SIZE 32
+#define MAC_KEY_SIZE 32
+#define DERIVED_KEY_SIZE 64
+#define MAC_SIZE 32
+
+#define AUTO_LOCK_DEFAULT 120
+
+#define SESSION_BYTES 24
+
+#define LONG_PRESS_MS 650
+
+// ============================================================
+// TYPES
+// ============================================================
+
+enum RecordType : uint8_t {
+  RECORD_PASSWORD = 0
+};
+
+struct VaultRecord {
+  uint8_t type;
+  char name[MAX_NAME];
+  char username[MAX_USER];
+  char password[MAX_PASS];
+  char note[MAX_NOTE];
+};
+
+struct VaultData {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t count;
+  VaultRecord records[MAX_RECORDS];
+};
+
+struct DeviceConfig {
+  uint32_t magic;
+  uint16_t version;
+  uint32_t autoLockSeconds;
+  char apPassword[11];
+};
+
+struct VaultHeader {
+  uint32_t magic;
+  uint16_t version;
+  uint8_t salt[SALT_SIZE];
+  uint8_t iv[IV_SIZE];
+  uint32_t dataLen;
+};
+
+struct ButtonState {
+  bool last;
+  unsigned long down;
+  bool longFired;
+};
+
+struct UnlockResult {
+  bool ok;
+  unsigned long waitSeconds;
+};
+
+enum ButtonEvent {
+  BTN_NONE,
+  BTN_SHORT,
+  BTN_LONG
+};
+
+enum Screen {
+  SCREEN_SETUP,
+  SCREEN_LOCKED,
+  SCREEN_UNLOCK,
+  SCREEN_HOME,
+  SCREEN_LIST,
+  SCREEN_RECORD,
+  SCREEN_ADD,
+  SCREEN_EDIT,
+  SCREEN_SEARCH,
+  SCREEN_GENERATOR,
+  SCREEN_SETTINGS,
+  SCREEN_CHANGE_MASTER
+};
+
+enum EditTarget {
+  EDIT_NONE,
+  EDIT_MASTER,
+  EDIT_MASTER_CONFIRM,
+  EDIT_NAME,
+  EDIT_USERNAME,
+  EDIT_PASSWORD,
+  EDIT_NOTE,
+  EDIT_SEARCH
+};
+
+// ============================================================
+// GLOBALS
+// ============================================================
+
+VaultData vault;
+DeviceConfig config;
+
+bool vaultUnlocked = false;
+
+uint8_t encryptionKey[AES_KEY_SIZE];
+uint8_t macKey[MAC_KEY_SIZE];
+uint8_t activeSalt[SALT_SIZE];
+
+unsigned long lastActivity = 0;
+
+String apSsid;
+String webToken;
+
+uint8_t failedAttempts = 0;
+unsigned long lockoutUntil = 0;
+
+Screen currentScreen = SCREEN_SETUP;
+
+int selectedRecord = 0;
+int menuIndex = 0;
+
+// Editor state
+char editorBuffer[MAX_EDITOR + 1];
+int editorLen = 0;
+int editorCursor = 0;          // <-- NEW: cursor position
+int editorCharset = 0;
+int editorCharIndex = 0;
+EditTarget editorTarget = EDIT_NONE;
+
+// Master confirm
+char confirmMasterBuffer[MAX_EDITOR + 1];
+
+// Search
+char searchBuffer[MAX_EDITOR + 1];
+int searchCount = 0;
+int searchResults[MAX_RECORDS];
+
+// Generator
+char generatedPassword[MAX_PASS + 1];
+int generatorLength = 24;
+int generatorMode = 0;
+
+const char* generatorLabels[] = {
+  "Aaz9#",
+  "Aaz9",
+  "Aaz",
+  "Aaz#"
+};
+
+// ADD/EDIT flow
+int editRecordIndex = -1;
+int editField = 0;
+
+bool recordPasswordVisible = false;
+
+// ============================================================
+// CHARSETS
+// ============================================================
+
+const char* CHARSET_LOWER   = "abcdefghijklmnopqrstuvwxyz";
+const char* CHARSET_UPPER   = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const char* CHARSET_DIGITS  = "0123456789";
+const char* CHARSET_SYMBOLS = "!@#$%^&*()-_=+[]{}.,:;?/";
+
+const char* CHARSET_GROUPS[] = {
+  CHARSET_LOWER,
+  CHARSET_UPPER,
+  CHARSET_DIGITS,
+  CHARSET_SYMBOLS
+};
+
+const char* CHARSET_LABELS[] = {
+  "abc",
+  "ABC",
+  "123",
+  "#@!"
+};
+
+// ============================================================
+// BUTTON STATE
+// ============================================================
+
+ButtonState bR5 = { HIGH, 0, false };
+ButtonState bR6 = { HIGH, 0, false };
+ButtonState bR7 = { HIGH, 0, false };
+ButtonState bR8 = { HIGH, 0, false };
+
+ButtonEvent pollButton(uint8_t pin, ButtonState &b) {
+  bool state = digitalRead(pin);
+  unsigned long now = millis();
+
+  if (b.last == HIGH && state == LOW) {
+    b.last = LOW;
+    b.down = now;
+    b.longFired = false;
+    return BTN_NONE;
+  }
+  if (b.last == LOW && state == LOW && !b.longFired &&
+      now - b.down >= LONG_PRESS_MS) {
+    b.longFired = true;
+    return BTN_LONG;
+  }
+  if (b.last == LOW && state == HIGH) {
+    b.last = HIGH;
+    if (!b.longFired) return BTN_SHORT;
+  }
+  return BTN_NONE;
+}
+
+// ============================================================
+// RANDOM
+// ============================================================
+
+uint32_t secureRandom() { return esp_random(); }
+
+void randomBytes(uint8_t* dst, size_t len) {
+  for (size_t i = 0; i < len; i += 4) {
+    uint32_t r = secureRandom();
+    for (int j = 0; j < 4 && i + j < len; j++)
+      dst[i + j] = (r >> (j * 8)) & 0xFF;
+  }
+}
+
+String randomHexToken(size_t bytes) {
+  if (bytes > SESSION_BYTES) bytes = SESSION_BYTES;
+  uint8_t buf[SESSION_BYTES];
+  randomBytes(buf, bytes);
+  const char* hex = "0123456789abcdef";
+  String out;
+  out.reserve(bytes * 2);
+  for (size_t i = 0; i < bytes; i++) {
+    out += hex[(buf[i] >> 4) & 0xF];
+    out += hex[buf[i] & 0xF];
+  }
+  memset(buf, 0, sizeof(buf));
+  return out;
+}
+
+String generateApPassword() {
+  const char* chars =
+    "abcdefghjkmnpqrstuvwxyz"
+    "ABCDEFGHJKMNPQRSTUVWXYZ"
+    "23456789";
+  const size_t n = strlen(chars);
+  String result;
+  for (int i = 0; i < 10; i++) result += chars[secureRandom() % n];
+  return result;
+}
+
+// ============================================================
+// CONSTANT TIME
+// ============================================================
+
+bool constantTimeEquals(const uint8_t* a, const uint8_t* b, size_t len) {
+  uint8_t diff = 0;
+  for (size_t i = 0; i < len; i++) diff |= a[i] ^ b[i];
+  return diff == 0;
+}
+
+bool constantTimeEquals(const String &a, const String &b) {
+  if (a.length() != b.length()) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < a.length(); i++)
+    diff |= (uint8_t)a[i] ^ (uint8_t)b[i];
+  return diff == 0;
+}
+
+// ============================================================
+// KDF
+// ============================================================
+
+bool deriveKeys(const char* password, size_t pwLen,
+                const uint8_t* salt,
+                uint8_t* aesOut, uint8_t* macOut) {
+  const mbedtls_md_info_t* md =
+    mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!md) return false;
+
+  uint8_t derived[DERIVED_KEY_SIZE];
+  memset(derived, 0, sizeof(derived));
+
+  int rc = mbedtls_pkcs5_pbkdf2_hmac_ext(
+      MBEDTLS_MD_SHA256,
+      (const unsigned char*)password, pwLen,
+      salt, SALT_SIZE,
+      PBKDF2_ITERATIONS,
+      DERIVED_KEY_SIZE,
+      derived);
+
+  if (rc != 0) { memset(derived, 0, sizeof(derived)); return false; }
+
+  memcpy(aesOut, derived, AES_KEY_SIZE);
+  memcpy(macOut, derived + AES_KEY_SIZE, MAC_KEY_SIZE);
+  memset(derived, 0, sizeof(derived));
+  return true;
+}
+
+bool deriveKeys(const String& password,
+                const uint8_t* salt,
+                uint8_t* aesOut, uint8_t* macOut) {
+  return deriveKeys(password.c_str(), password.length(),
+                    salt, aesOut, macOut);
+}
+
+// ============================================================
+// HMAC
+// ============================================================
+
+bool hmacSha256(const uint8_t* key, size_t keyLen,
+                const uint8_t* data, size_t dataLen,
+                uint8_t* output) {
+  const mbedtls_md_info_t* md =
+    mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!md) return false;
+  return mbedtls_md_hmac(md, key, keyLen, data, dataLen, output) == 0;
+}
+
+// ============================================================
+// AES CBC
+// ============================================================
+
+bool aesEncrypt(const uint8_t* input, uint8_t* output, size_t len,
+                const uint8_t* key, const uint8_t* iv) {
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  if (mbedtls_aes_setkey_enc(&aes, key, 256) != 0) {
+    mbedtls_aes_free(&aes); return false;
+  }
+  uint8_t ivLocal[16];
+  memcpy(ivLocal, iv, 16);
+  int rc = mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT,
+                                 len, ivLocal, input, output);
+  memset(ivLocal, 0, sizeof(ivLocal));
+  mbedtls_aes_free(&aes);
+  return rc == 0;
+}
+
+bool aesDecrypt(const uint8_t* input, uint8_t* output, size_t len,
+                const uint8_t* key, const uint8_t* iv) {
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  if (mbedtls_aes_setkey_dec(&aes, key, 256) != 0) {
+    mbedtls_aes_free(&aes); return false;
+  }
+  uint8_t ivLocal[16];
+  memcpy(ivLocal, iv, 16);
+  int rc = mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT,
+                                 len, ivLocal, input, output);
+  memset(ivLocal, 0, sizeof(ivLocal));
+  mbedtls_aes_free(&aes);
+  return rc == 0;
+}
+
+// ============================================================
+// PKCS7
+// ============================================================
+
+size_t paddedSize(size_t len) { return len + (16 - (len % 16)); }
+
+bool addPadding(const uint8_t* input, size_t len,
+                uint8_t* output, size_t outputLen) {
+  size_t pad = 16 - (len % 16);
+  if (outputLen < len + pad) return false;
+  memcpy(output, input, len);
+  for (size_t i = len; i < len + pad; i++) output[i] = pad;
+  return true;
+}
+
+bool removePadding(uint8_t* data, size_t &len) {
+  if (len == 0 || len % 16 != 0) return false;
+  uint8_t pad = data[len - 1];
+  if (pad == 0 || pad > 16) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < pad; i++) diff |= data[len - 1 - i] ^ pad;
+  if (diff != 0) return false;
+  len -= pad;
+  return true;
+}
+
+// ============================================================
+// CONFIG
+// ============================================================
+
+bool saveConfig() {
+  File f = LittleFS.open(CONFIG_TMP, FILE_WRITE);
+  if (!f) return false;
+  size_t written = f.write((const uint8_t*)&config, sizeof(config));
+  f.flush(); f.close();
+  if (written != sizeof(config)) {
+    LittleFS.remove(CONFIG_TMP); return false;
+  }
+  LittleFS.remove(CONFIG_FILE);
+  if (!LittleFS.rename(CONFIG_TMP, CONFIG_FILE)) {
+    LittleFS.remove(CONFIG_TMP); return false;
+  }
+  return true;
+}
+
+bool loadConfig() {
+  if (!LittleFS.exists(CONFIG_FILE)) return false;
+  File f = LittleFS.open(CONFIG_FILE, FILE_READ);
+  if (!f) return false;
+  size_t got = f.read((uint8_t*)&config, sizeof(config));
+  f.close();
+  if (got != sizeof(config)) return false;
+  if (config.magic != CONFIG_MAGIC) return false;
+  if (config.version != CONFIG_VERSION) return false;
+  return true;
+}
+
+// ============================================================
+// MAC OVER VAULT FILE
+// ============================================================
+
+bool calculateVaultMac(const VaultHeader& header,
+                       const uint8_t* ciphertext,
+                       size_t cipherLen, uint8_t* mac) {
+  size_t headerSize = sizeof(VaultHeader);
+  size_t total = headerSize + cipherLen;
+  uint8_t* data = (uint8_t*)malloc(total);
+  if (!data) return false;
+  memcpy(data, &header, headerSize);
+  memcpy(data + headerSize, ciphertext, cipherLen);
+  bool ok = hmacSha256(macKey, MAC_KEY_SIZE, data, total, mac);
+  memset(data, 0, total);
+  free(data);
+  return ok;
+}
+
+// ============================================================
+// SAVE VAULT
+// ============================================================
+
+bool saveVaultWithSalt(const uint8_t* salt) {
+  VaultHeader header;
+  header.magic = VAULT_MAGIC;
+  header.version = VAULT_VERSION;
+  memcpy(header.salt, salt, SALT_SIZE);
+  randomBytes(header.iv, IV_SIZE);
+
+  size_t plainLen = sizeof(VaultData);
+  size_t cipherLen = paddedSize(plainLen);
+  header.dataLen = cipherLen;
+
+  uint8_t* plain = (uint8_t*)malloc(cipherLen);
+  uint8_t* encrypted = (uint8_t*)malloc(cipherLen);
+  if (!plain || !encrypted) {
+    if (plain) free(plain);
+    if (encrypted) free(encrypted);
+    return false;
+  }
+
+  if (!addPadding((uint8_t*)&vault, plainLen, plain, cipherLen)) {
+    memset(plain, 0, cipherLen); memset(encrypted, 0, cipherLen);
+    free(plain); free(encrypted); return false;
+  }
+  if (!aesEncrypt(plain, encrypted, cipherLen, encryptionKey, header.iv)) {
+    memset(plain, 0, cipherLen); memset(encrypted, 0, cipherLen);
+    free(plain); free(encrypted); return false;
+  }
+
+  uint8_t mac[MAC_SIZE];
+  if (!calculateVaultMac(header, encrypted, cipherLen, mac)) {
+    memset(plain, 0, cipherLen); memset(encrypted, 0, cipherLen);
+    free(plain); free(encrypted); return false;
+  }
+
+  File f = LittleFS.open(VAULT_TMP, FILE_WRITE);
+  if (!f) {
+    memset(plain, 0, cipherLen); memset(encrypted, 0, cipherLen);
+    free(plain); free(encrypted); return false;
+  }
+
+  bool ok = true;
+  if (f.write((const uint8_t*)&header, sizeof(header)) != sizeof(header)) ok = false;
+  if (ok && f.write(encrypted, cipherLen) != cipherLen) ok = false;
+  if (ok && f.write(mac, MAC_SIZE) != MAC_SIZE) ok = false;
+  f.flush(); f.close();
+
+  if (!ok) {
+    LittleFS.remove(VAULT_TMP);
+  } else {
+    LittleFS.remove(VAULT_FILE);
+    if (!LittleFS.rename(VAULT_TMP, VAULT_FILE)) {
+      LittleFS.remove(VAULT_TMP); ok = false;
+    }
+  }
+
+  memset(plain, 0, cipherLen);
+  memset(encrypted, 0, cipherLen);
+  memset(mac, 0, sizeof(mac));
+  free(plain); free(encrypted);
+  return ok;
+}
+
+bool saveCurrentVault() { return saveVaultWithSalt(activeSalt); }
+
+// ============================================================
+// LOAD VAULT
+// ============================================================
+
+bool loadVaultWithPassword(const char* pw, size_t pwLen,
+                           uint8_t* outSalt,
+                           uint8_t* outAES, uint8_t* outMAC,
+                           VaultData* outVault) {
+  if (!LittleFS.exists(VAULT_FILE)) return false;
+  File f = LittleFS.open(VAULT_FILE, FILE_READ);
+  if (!f) return false;
+
+  VaultHeader header;
+  if (f.read((uint8_t*)&header, sizeof(header)) != sizeof(header)) {
+    f.close(); return false;
+  }
+  if (header.magic != VAULT_MAGIC ||
+      header.version != VAULT_VERSION ||
+      header.dataLen == 0 || header.dataLen > 65536 ||
+      header.dataLen % 16 != 0) {
+    f.close(); return false;
+  }
+
+  uint8_t* encrypted = (uint8_t*)malloc(header.dataLen);
+  uint8_t* plain     = (uint8_t*)malloc(header.dataLen);
+  if (!encrypted || !plain) {
+    if (encrypted) free(encrypted);
+    if (plain) free(plain);
+    f.close(); return false;
+  }
+
+  if (f.read(encrypted, header.dataLen) != header.dataLen) {
+    free(encrypted); free(plain); f.close(); return false;
+  }
+  uint8_t storedMac[MAC_SIZE];
+  if (f.read(storedMac, MAC_SIZE) != MAC_SIZE) {
+    free(encrypted); free(plain); f.close(); return false;
+  }
+  f.close();
+
+  uint8_t derived[AES_KEY_SIZE + MAC_KEY_SIZE];
+  if (!deriveKeys(pw, pwLen, header.salt, derived, derived + AES_KEY_SIZE)) {
+    free(encrypted); free(plain); return false;
+  }
+
+  uint8_t savedMacKey[MAC_KEY_SIZE];
+  memcpy(savedMacKey, macKey, MAC_KEY_SIZE);
+  memcpy(macKey, derived + AES_KEY_SIZE, MAC_KEY_SIZE);
+
+  uint8_t calculatedMac[MAC_SIZE];
+  bool macOk = calculateVaultMac(header, encrypted, header.dataLen, calculatedMac);
+
+  if (!macOk || !constantTimeEquals(calculatedMac, storedMac, MAC_SIZE)) {
+    memcpy(macKey, savedMacKey, MAC_KEY_SIZE);
+    memset(savedMacKey, 0, sizeof(savedMacKey));
+    memset(derived, 0, sizeof(derived));
+    memset(calculatedMac, 0, sizeof(calculatedMac));
+    free(encrypted); free(plain);
+    return false;
+  }
+
+  memcpy(encryptionKey, derived, AES_KEY_SIZE);
+  memcpy(macKey, derived + AES_KEY_SIZE, MAC_KEY_SIZE);
+
+  bool decOk = aesDecrypt(encrypted, plain, header.dataLen,
+                          encryptionKey, header.iv);
+
+  memset(savedMacKey, 0, sizeof(savedMacKey));
+  memset(derived, 0, sizeof(derived));
+  memset(calculatedMac, 0, sizeof(calculatedMac));
+
+  if (!decOk) { free(encrypted); free(plain); return false; }
+
+  size_t plainLen = header.dataLen;
+  if (!removePadding(plain, plainLen)) { free(encrypted); free(plain); return false; }
+  if (plainLen != sizeof(VaultData)) { free(encrypted); free(plain); return false; }
+
+  memcpy(outVault, plain, sizeof(VaultData));
+  memcpy(outSalt, header.salt, SALT_SIZE);
+  memcpy(outAES, derived, AES_KEY_SIZE);
+  memcpy(outMAC, derived + AES_KEY_SIZE, MAC_KEY_SIZE);
+
+  memset(plain, 0, header.dataLen);
+  memset(encrypted, 0, header.dataLen);
+  free(encrypted); free(plain);
+
+  if (outVault->magic != VAULT_MAGIC ||
+      outVault->version != VAULT_VERSION ||
+      outVault->count > MAX_RECORDS)
+    return false;
+
+  return true;
+}
+
+// ============================================================
+// CREATE / UNLOCK / LOCK
+// ============================================================
+
+bool createMasterPassword(const String& password) {
+  if (password.length() < 8 || password.length() > 64) return false;
+  uint8_t salt[SALT_SIZE];
+  randomBytes(salt, SALT_SIZE);
+  if (!deriveKeys(password, salt, encryptionKey, macKey)) return false;
+  memset(&vault, 0, sizeof(vault));
+  vault.magic = VAULT_MAGIC;
+  vault.version = VAULT_VERSION;
+  vault.count = 0;
+  if (!saveVaultWithSalt(salt)) {
+    memset(encryptionKey, 0, sizeof(encryptionKey));
+    memset(macKey, 0, sizeof(macKey));
+    memset(salt, 0, sizeof(salt));
+    return false;
+  }
+  memcpy(activeSalt, salt, SALT_SIZE);
+  memset(salt, 0, sizeof(salt));
+  vaultUnlocked = true;
+  lastActivity = millis();
+  return true;
+}
+
+bool unlockVault(const char* pw, size_t pwLen) {
+  VaultData tempVault;
+  uint8_t salt[SALT_SIZE];
+  uint8_t aes[AES_KEY_SIZE];
+  uint8_t mac[MAC_KEY_SIZE];
+  memset(&tempVault, 0, sizeof(tempVault));
+
+  if (!loadVaultWithPassword(pw, pwLen, salt, aes, mac, &tempVault)) {
+    memset(salt, 0, sizeof(salt));
+    memset(aes, 0, sizeof(aes));
+    memset(mac, 0, sizeof(mac));
+    return false;
+  }
+  memcpy(&vault, &tempVault, sizeof(vault));
+  memcpy(activeSalt, salt, SALT_SIZE);
+  memcpy(encryptionKey, aes, AES_KEY_SIZE);
+  memcpy(macKey, mac, MAC_KEY_SIZE);
+
+  memset(&tempVault, 0, sizeof(tempVault));
+  memset(salt, 0, sizeof(salt));
+  memset(aes, 0, sizeof(aes));
+  memset(mac, 0, sizeof(mac));
+
+  vaultUnlocked = true;
+  lastActivity = millis();
+  return true;
+}
+
+void lockVault() {
+  vaultUnlocked = false;
+  webToken = "";
+  memset(encryptionKey, 0, sizeof(encryptionKey));
+  memset(macKey, 0, sizeof(macKey));
+  memset(activeSalt, 0, sizeof(activeSalt));
+  memset(&vault, 0, sizeof(vault));
+  memset(editorBuffer, 0, sizeof(editorBuffer));
+  editorLen = 0;
+  editorCursor = 0;
+  selectedRecord = 0;
+  menuIndex = 0;
+  currentScreen = SCREEN_LOCKED;
+}
+
+UnlockResult attemptUnlock(const char* pw, size_t pwLen) {
+  UnlockResult r;
+  r.ok = false;
+  r.waitSeconds = 0;
+  unsigned long now = millis();
+
+  if (now < lockoutUntil) {
+    r.waitSeconds = (lockoutUntil - now + 999) / 1000;
+    return r;
+  }
+  if (unlockVault(pw, pwLen)) {
+    failedAttempts = 0;
+    lockoutUntil = 0;
+    r.ok = true;
+    return r;
+  }
+  if (failedAttempts < 8) failedAttempts++;
+  const unsigned long delays[] = {0,1,2,4,8,15,30,60,120};
+  unsigned long delaySec = delays[failedAttempts];
+  lockoutUntil = now + delaySec * 1000UL;
+  r.waitSeconds = delaySec;
+  return r;
+}
+
+UnlockResult attemptUnlock(const String& pw) {
+  return attemptUnlock(pw.c_str(), pw.length());
+}
+
+// ============================================================
+// PASSWORD GENERATOR
+// ============================================================
+
+void generatePassword(char* out, int length,
+                      bool upper, bool lower,
+                      bool numbers, bool symbols) {
+  char chars[128];
+  int n = 0;
+  if (upper)   for (const char* p = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"; *p; p++) chars[n++] = *p;
+  if (lower)   for (const char* p = "abcdefghijklmnopqrstuvwxyz"; *p; p++) chars[n++] = *p;
+  if (numbers) for (const char* p = "0123456789"; *p; p++) chars[n++] = *p;
+  if (symbols) for (const char* p = "!@#$%^&*()-_=+[]{}"; *p; p++) chars[n++] = *p;
+  if (n == 0)  for (const char* p = "abcdefghijklmnopqrstuvwxyz"; *p; p++) chars[n++] = *p;
+  chars[n] = 0;
+
+  if (length > MAX_PASS) length = MAX_PASS;
+  for (int i = 0; i < length; i++)
+    out[i] = chars[secureRandom() % n];
+  out[length] = 0;
+}
+
+void applyGeneratorMode(bool &up, bool &lo, bool &nu, bool &sy) {
+  switch (generatorMode) {
+    case 0: up = true;  lo = true;  nu = true;  sy = true;  break;
+    case 1: up = true;  lo = true;  nu = true;  sy = false; break;
+    case 2: up = true;  lo = true;  nu = true;  sy = false; break;
+    case 3: up = true;  lo = true;  nu = false; sy = true;  break;
+  }
+}
+
+void newGeneratedPassword() {
+  bool up, lo, nu, sy;
+  applyGeneratorMode(up, lo, nu, sy);
+  generatePassword(generatedPassword, generatorLength, up, lo, nu, sy);
+}
+
+// ============================================================
+// HTML ESCAPE
+// ============================================================
+
+String htmlEscape(const String &in) {
+  String out;
+  out.reserve(in.length() + 16);
+  for (size_t i = 0; i < in.length(); i++) {
+    switch (in[i]) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      case '\'': out += "&#39;"; break;
+      default: out += in[i];
+    }
+  }
+  return out;
+}
+
+// ============================================================
+// WEB SESSION
+// ============================================================
+
+bool getCookieToken(String &token) {
+  if (!server.hasHeader("Cookie")) return false;
+  String cookie = server.header("Cookie");
+  int pos = cookie.indexOf("session=");
+  if (pos < 0) return false;
+  token = cookie.substring(pos + 8);
+  int semi = token.indexOf(';');
+  if (semi >= 0) token = token.substring(0, semi);
+  token.trim();
+  return token.length() > 0;
+}
+
+bool checkSession() {
+  if (!vaultUnlocked || webToken.length() == 0) return false;
+  String token;
+  if (!getCookieToken(token)) return false;
+  return constantTimeEquals(token, webToken);
+}
+
+void setSessionCookie() {
+  server.sendHeader("Set-Cookie",
+    "session=" + webToken + "; Path=/; HttpOnly; SameSite=Strict");
+}
+
+void clearSessionCookie() {
+  server.sendHeader("Set-Cookie", "session=deleted; Path=/; Max-Age=0");
+}
+
+void redirectTo(const String &path) {
+  server.sendHeader("Location", path);
+  server.send(303);
+}
+
+bool requireAuth() {
+  if (!checkSession()) { redirectTo("/"); return false; }
+  lastActivity = millis();
+  return true;
+}
+
+bool checkCSRF() {
+  if (!constantTimeEquals(server.arg("csrf"), webToken)) {
+    server.send(403, "text/plain", "Invalid CSRF token");
+    return false;
+  }
+  return true;
+}
+
+// ============================================================
+// WEB UI
+// ============================================================
+
+String htmlHeader(const String& title) {
+  String h;
+  h.reserve(4096);
+  h += F("<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'>"
+         "<meta name='viewport' content='width=device-width,initial-scale=1'>");
+  h += F("<title>");
+  h += htmlEscape(title);
+  h += F(" · VAULT</title>");
+  h += F(R"HTML(
+<style>
+:root{--bg:#080a0d;--panel:#11151a;--panel2:#171c22;--border:#252b33;--text:#edf2f5;--muted:#89939f;--accent:#57e6a5;--danger:#ff6464;--radius:16px}
+*{box-sizing:border-box}
+body{margin:0 auto;max-width:700px;padding:18px 15px 50px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.45}
+h1{font-size:1.35rem;margin:3px 0 10px}
+h2{font-size:1rem;color:var(--muted)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin:12px 0}
+.top{display:flex;align-items:center;justify-content:space-between;gap:10px}
+input,textarea,select{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:11px;padding:12px;margin:6px 0;font:inherit}
+input.mono,textarea.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+button,.btn{display:inline-block;padding:10px 13px;border-radius:11px;border:1px solid var(--border);background:var(--panel2);color:var(--text);text-decoration:none;cursor:pointer}
+button.primary,.btn.primary{background:var(--accent);border-color:var(--accent);color:#04120b;font-weight:700}
+button.danger,.btn.danger{color:var(--danger)}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.entry{padding:14px;border:1px solid var(--border);border-radius:13px;margin:9px 0;background:var(--panel)}
+.name{font-weight:700}
+.user{color:var(--muted);font-size:.9rem}
+.small{font-size:.85rem}
+.muted{color:var(--muted)}
+.error{color:var(--danger)}
+.stat{display:flex;justify-content:space-between;margin:4px 0}
+.bar{height:8px;background:var(--panel2);border-radius:8px;overflow:hidden}
+.fill{height:100%;background:var(--accent)}
+.chk{display:inline-flex;gap:5px;align-items:center;margin:5px 12px 5px 0;color:var(--muted)}
+.warn{border-color:#725f24}
+</style>
+)HTML");
+  h += F("</head><body>");
+  return h;
+}
+
+String htmlFooter() {
+  return F(R"HTML(
+<script>
+function copyField(id){const e=document.getElementById(id);if(!e)return;
+ navigator.clipboard?navigator.clipboard.writeText(e.value):(e.select(),document.execCommand('copy'));}
+function toggleField(id,b){const e=document.getElementById(id);
+ if(e.type==='password'){e.type='text';b.textContent='Скрыть';}
+ else{e.type='password';b.textContent='Показать';}}
+</script>
+</body></html>
+)HTML");
+}
+
+// ============================================================
+// WEB HOME
+// ============================================================
+
+void webHome() {
+  if (!LittleFS.exists(VAULT_FILE)) { redirectTo("/setup"); return; }
+
+  if (!checkSession()) {
+    String h = htmlHeader("Unlock");
+    h += F("<div class='card'><h1>🔐 VAULT</h1><p class='muted'>Введите мастер-пароль.</p>");
+    if (server.hasArg("err")) {
+      String wait = server.arg("wait");
+      h += F("<p class='error'>Неверный пароль.");
+      if (wait.length()) { h += F(" Повтор через "); h += htmlEscape(wait); h += F(" с."); }
+      h += F("</p>");
+    }
+    h += F("<form method='POST' action='/unlock'>"
+           "<input type='password' name='password' placeholder='Мастер-пароль' autocomplete='current-password' autofocus>"
+           "<button class='primary' type='submit'>Разблокировать</button></form></div>");
+    h += htmlFooter();
+    server.send(200, "text/html", h);
+    return;
+  }
+
+  size_t used = LittleFS.usedBytes();
+  size_t total = LittleFS.totalBytes();
+  int pct = total ? (used * 100UL) / total : 0;
+
+  String h = htmlHeader("VAULT");
+  h.reserve(8192);
+  h += F("<div class='top'><h1>🔐 VAULT</h1>"
+         "<form method='POST' action='/lock'>"
+         "<input type='hidden' name='csrf' value='");
+  h += webToken;
+  h += F("'><button class='danger'>Заблокировать</button></form></div>");
+
+  h += F("<div class='card'><div class='stat'><span>Записей</span><b>");
+  h += String(vault.count);
+  h += F(" / ");
+  h += String(MAX_RECORDS);
+  h += F("</b></div><div class='stat'><span>Flash</span><b>");
+  h += String(used / 1024);
+  h += F(" / ");
+  h += String(total / 1024);
+  h += F(" КБ</b></div><div class='bar'><div class='fill' style='width:");
+  h += String(pct);
+  h += F("%'></div></div></div>");
+
+  h += F("<div class='actions'>"
+         "<a class='btn primary' href='/add'>+ Добавить</a>"
+         "<a class='btn' href='/search'>Поиск</a>"
+         "<a class='btn' href='/generator'>Генератор</a>"
+         "<a class='btn' href='/settings'>Настройки</a></div>");
+
+  for (int i = 0; i < vault.count; i++) {
+    VaultRecord &r = vault.records[i];
+    h += F("<div class='entry'><div class='name'>");
+    h += htmlEscape(r.name);
+    h += F("</div><div class='user'>");
+    h += htmlEscape(r.username);
+    h += F("</div><div class='actions'><a class='btn small' href='/view?id=");
+    h += String(i);
+    h += F("'>Открыть</a><a class='btn small' href='/edit?id=");
+    h += String(i);
+    h += F("'>Изменить</a>"
+           "<form method='POST' action='/delete' style='display:inline' "
+           "onsubmit=\"return confirm('Удалить запись?')\">"
+           "<input type='hidden' name='id' value='");
+    h += String(i);
+    h += F("'><input type='hidden' name='csrf' value='");
+    h += webToken;
+    h += F("'><button class='danger small'>Удалить</button></form></div></div>");
+  }
+  if (vault.count == 0) h += F("<div class='card muted'>Vault пока пуст.</div>");
+  h += htmlFooter();
+  server.send(200, "text/html", h);
+}
+
+// ============================================================
+// SETUP WEB
+// ============================================================
+
+void webSetup() {
+  if (LittleFS.exists(VAULT_FILE)) { redirectTo("/"); return; }
+
+  String h = htmlHeader("Первичная настройка");
+  h += F("<div class='card'><h1>Первичная настройка</h1>"
+         "<p class='muted'>Мастер-пароль защищает весь vault. Минимум 8 символов.</p>"
+         "<p class='warn card'>ВАЖНО: забытый мастер-пароль невосстановим.</p>");
+  if (server.hasArg("err"))
+    h += F("<p class='error'>Пароли не совпадают или имеют недопустимую длину.</p>");
+  h += F("<form method='POST' action='/setup'>"
+         "<input type='password' name='password' placeholder='Мастер-пароль' required>"
+         "<input type='password' name='confirm' placeholder='Повторить' required>"
+         "<button class='primary'>Создать vault</button></form></div>");
+  h += F("<div class='card'><h2>Wi-Fi</h2><div class='muted'>SSID</div><b>");
+  h += htmlEscape(apSsid);
+  h += F("</b><div class='muted'>Пароль</div><b>");
+  h += htmlEscape(config.apPassword);
+  h += F("</b><p class='muted small'>Подключитесь к этой сети и откройте 192.168.4.1.</p></div>");
+  h += htmlFooter();
+  server.send(200, "text/html", h);
+}
+
+void webSetupPost() {
+  if (LittleFS.exists(VAULT_FILE)) { redirectTo("/"); return; }
+  String p1 = server.arg("password");
+  String p2 = server.arg("confirm");
+  if (p1.length() < 8 || p1.length() > 64 || p1 != p2) {
+    redirectTo("/setup?err=1"); return;
+  }
+  if (!createMasterPassword(p1)) {
+    server.send(500, "text/plain", "Setup failed"); return;
+  }
+  webToken = randomHexToken(SESSION_BYTES);
+  setSessionCookie();
+  redirectTo("/");
+}
+
+// ============================================================
+// UNLOCK WEB  —  FIX: lockVault not called here
+// ============================================================
+
+void webUnlockPost() {
+  String password = server.arg("password");
+  UnlockResult r = attemptUnlock(password.c_str(), password.length());
+
+  if (r.ok) {
+    webToken = randomHexToken(SESSION_BYTES);
+    setSessionCookie();
+    redirectTo("/");
+    return;
+  }
+  String q = "/?err=1";
+  if (r.waitSeconds) { q += "&wait="; q += String(r.waitSeconds); }
+  redirectTo(q);
+}
+
+// ============================================================
+// ADD
+// ============================================================
+
+void webAdd() {
+  if (!requireAuth()) return;
+  String h = htmlHeader("Добавить");
+  h += F("<div class='card'><h1>+ Новая запись</h1>"
+         "<form method='POST' action='/add'>"
+         "<input name='name' placeholder='Сервис' required>"
+         "<input name='username' placeholder='Логин / email'>"
+         "<input name='password' placeholder='Пароль'>"
+         "<textarea name='note' rows='4' placeholder='Заметка'></textarea>"
+         "<input type='hidden' name='csrf' value='");
+  h += webToken;
+  h += F("'><button class='primary'>Сохранить</button></form></div>"
+         "<a class='btn' href='/'>← Назад</a>");
+  h += htmlFooter();
+  server.send(200, "text/html", h);
+}
+
+void webAddPost() {
+  if (!requireAuth()) return;
+  if (!checkCSRF()) return;
+  if (vault.count >= MAX_RECORDS) { server.send(409, "text/plain", "Vault full"); return; }
+  String name = server.arg("name");
+  name.trim();
+  if (!name.length()) { server.send(400, "text/plain", "Name required"); return; }
+
+  VaultRecord &r = vault.records[vault.count];
+  memset(&r, 0, sizeof(r));
+  r.type = RECORD_PASSWORD;
+  strlcpy(r.name, name.c_str(), MAX_NAME);
+  strlcpy(r.username, server.arg("username").c_str(), MAX_USER);
+  strlcpy(r.password, server.arg("password").c_str(), MAX_PASS);
+  strlcpy(r.note, server.arg("note").c_str(), MAX_NOTE);
+  vault.count++;
+
+  if (!saveCurrentVault()) {
+    vault.count--;
+    memset(&vault.records[vault.count], 0, sizeof(VaultRecord));
+    server.send(500, "text/plain", "Vault write failed");
+    return;
+  }
+  redirectTo("/");
+}
+
+// ============================================================
+// VIEW
+// ============================================================
+
+void webView() {
+  if (!requireAuth()) return;
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= vault.count) { server.send(404, "text/plain", "Not found"); return; }
+  VaultRecord &r = vault.records[id];
+  String h = htmlHeader(r.name);
+  h += F("<div class='card'><h1>");
+  h += htmlEscape(r.name);
+  h += F("</h1><div class='muted'>Логин</div><input value='");
+  h += htmlEscape(r.username);
+  h += F("' readonly><div class='muted'>Пароль</div>"
+         "<input class='mono' type='password' id='pass' value='");
+  h += htmlEscape(r.password);
+  h += F("' readonly><div class='actions'>"
+         "<button onclick=\"toggleField('pass',this)\">Показать</button>"
+         "<button onclick=\"copyField('pass')\">Копировать</button>"
+         "<a class='btn' href='/edit?id=");
+  h += String(id);
+  h += F("'>Изменить</a></div>");
+  if (strlen(r.note)) {
+    h += F("<div class='muted'>Заметка</div><textarea readonly rows='4'>");
+    h += htmlEscape(r.note);
+    h += F("</textarea>");
+  }
+  h += F("</div><a class='btn' href='/'>← Назад</a>");
+  h += htmlFooter();
+  server.send(200, "text/html", h);
+}
+
+// ============================================================
+// EDIT
+// ============================================================
+
+void webEdit() {
+  if (!requireAuth()) return;
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= vault.count) { server.send(404, "text/plain", "Not found"); return; }
+  VaultRecord &r = vault.records[id];
+  String h = htmlHeader("Изменить");
+  h += F("<div class='card'><h1>Изменить запись</h1>"
+         "<form method='POST' action='/edit'>"
+         "<input type='hidden' name='id' value='");
+  h += String(id);
+  h += F("'><input type='hidden' name='csrf' value='");
+  h += webToken;
+  h += F("'><input name='name' value='");
+  h += htmlEscape(r.name);
+  h += F("' required><input name='username' value='");
+  h += htmlEscape(r.username);
+  h += F("'><input name='password' value='");
+  h += htmlEscape(r.password);
+  h += F("'><textarea name='note' rows='4'>");
+  h += htmlEscape(r.note);
+  h += F("</textarea><button class='primary'>Сохранить изменения</button></form></div>"
+         "<a class='btn' href='/view?id=");
+  h += String(id);
+  h += F("'>← Назад</a>");
+  h += htmlFooter();
+  server.send(200, "text/html", h);
+}
+
+void webEditPost() {
+  if (!requireAuth()) return;
+  if (!checkCSRF()) return;
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= vault.count) { server.send(404, "text/plain", "Not found"); return; }
+
+  VaultRecord backup = vault.records[id];
+  String name = server.arg("name");
+  name.trim();
+  if (!name.length()) { server.send(400, "text/plain", "Name required"); return; }
+
+  VaultRecord &r = vault.records[id];
+  memset(&r, 0, sizeof(r));
+  r.type = RECORD_PASSWORD;
+  strlcpy(r.name, name.c_str(), MAX_NAME);
+  strlcpy(r.username, server.arg("username").c_str(), MAX_USER);
+  strlcpy(r.password, server.arg("password").c_str(), MAX_PASS);
+  strlcpy(r.note, server.arg("note").c_str(), MAX_NOTE);
+
+  if (!saveCurrentVault()) {
+    memcpy(&r, &backup, sizeof(r));
+    server.send(500, "text/plain", "Vault write failed");
+    return;
+  }
+  memset(&backup, 0, sizeof(backup));
+  redirectTo("/view?id=" + String(id));
+}
+
+// ============================================================
+// DELETE
+// ============================================================
+
+void webDeletePost() {
+  if (!requireAuth()) return;
+  if (!checkCSRF()) return;
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= vault.count) { server.send(404, "text/plain", "Not found"); return; }
+
+  VaultData backup = vault;
+  for (int i = id; i < vault.count - 1; i++)
+    memcpy(&vault.records[i], &vault.records[i + 1], sizeof(VaultRecord));
+  memset(&vault.records[vault.count - 1], 0, sizeof(VaultRecord));
+  vault.count--;
+
+  if (!saveCurrentVault()) {
+    memcpy(&vault, &backup, sizeof(vault));
+    memset(&backup, 0, sizeof(backup));
+    server.send(500, "text/plain", "Vault write failed");
+    return;
+  }
+  memset(&backup, 0, sizeof(backup));
+  redirectTo("/");
+}
+
+// ============================================================
+// SEARCH
+// ============================================================
+
+void webSearch() {
+  if (!requireAuth()) return;
+  String q = server.arg("q");
+  q.toLowerCase();
+
+  String h = htmlHeader("Поиск");
+  h += F("<div class='card'><h1>Поиск</h1><form method='GET'>"
+         "<input name='q' value='");
+  h += htmlEscape(server.arg("q"));
+  h += F("' placeholder='Сервис или логин' autofocus>"
+         "<button class='primary'>Искать</button></form></div>");
+
+  if (q.length()) {
+    int found = 0;
+    for (int i = 0; i < vault.count; i++) {
+      String name = vault.records[i].name;
+      String user = vault.records[i].username;
+      name.toLowerCase();
+      user.toLowerCase();
+      if (name.indexOf(q) >= 0 || user.indexOf(q) >= 0) {
+        h += F("<div class='entry'><div class='name'>");
+        h += htmlEscape(vault.records[i].name);
+        h += F("</div><div class='user'>");
+        h += htmlEscape(vault.records[i].username);
+        h += F("</div><div class='actions'><a class='btn' href='/view?id=");
+        h += String(i);
+        h += F("'>Открыть</a></div></div>");
+        found++;
+      }
+    }
+    if (!found) h += F("<div class='card muted'>Ничего не найдено.</div>");
+  }
+  h += F("<a class='btn' href='/'>← Назад</a>");
+  h += htmlFooter();
+  server.send(200, "text/html", h);
+}
+
+// ============================================================
+// GENERATOR WEB
+// ============================================================
+
+void webGenerator() {
+  if (!requireAuth()) return;
+
+  int len = server.hasArg("len") ? server.arg("len").toInt() : 24;
+  if (len < 8) len = 8;
+  if (len > MAX_PASS - 1) len = MAX_PASS - 1;
+
+  bool up = true, lo = true, nu = true, sy = true;
+  char p[MAX_PASS + 1];
+  generatePassword(p, len, up, lo, nu, sy);
+
+  String h = htmlHeader("Генератор");
+  h += F("<div class='card'><h1>🎲 Генератор</h1>"
+         "<input class='mono' id='generated' value='");
+  h += p;
+  h += F("' readonly><div class='actions'>"
+         "<button onclick=\"copyField('generated')\">Копировать</button></div></div>");
+
+  h += F("<form class='card' method='GET'><div>Длина: ");
+  h += String(len);
+  h += F("</div><input type='range' name='len' min='8' max='95' value='");
+  h += String(len);
+  h += F("'><label class='chk'><input type='checkbox' name='up' checked>A-Z</label>"
+         "<label class='chk'><input type='checkbox' name='lo' checked>a-z</label>"
+         "<label class='chk'><input type='checkbox' name='nu' checked>0-9</label>"
+         "<label class='chk'><input type='checkbox' name='sy' checked>!@#</label>"
+         "<button class='primary'>Сгенерировать</button></form>");
+
+  h += F("<div class='card'><h2>Сразу сохранить</h2>"
+         "<form method='POST' action='/add'>"
+         "<input name='name' placeholder='Сервис' required>"
+         "<input name='username' placeholder='Логин / email'>"
+         "<input type='hidden' name='password' value='");
+  h += p;
+  h += F("'><input type='hidden' name='csrf' value='");
+  h += webToken;
+  h += F("'><button class='primary'>Сохранить пароль</button></form></div>"
+         "<a class='btn' href='/'>← Назад</a>");
+  h += htmlFooter();
+  server.send(200, "text/html", h);
+}
+
+// ============================================================
+// CHANGE MASTER
+// ============================================================
+
+bool changeMasterPassword(const char* pw, size_t pwLen) {
+  if (pwLen < 8 || pwLen > 64) return false;
+
+  uint8_t newSalt[SALT_SIZE];
+  uint8_t newAES[AES_KEY_SIZE];
+  uint8_t newMAC[MAC_KEY_SIZE];
+  randomBytes(newSalt, SALT_SIZE);
+
+  if (!deriveKeys(pw, pwLen, newSalt, newAES, newMAC)) {
+    memset(newSalt, 0, sizeof(newSalt));
+    return false;
+  }
+
+  uint8_t oldAES[AES_KEY_SIZE], oldMAC[MAC_KEY_SIZE], oldSalt[SALT_SIZE];
+  memcpy(oldAES, encryptionKey, AES_KEY_SIZE);
+  memcpy(oldMAC, macKey, MAC_KEY_SIZE);
+  memcpy(oldSalt, activeSalt, SALT_SIZE);
+
+  memcpy(encryptionKey, newAES, AES_KEY_SIZE);
+  memcpy(macKey, newMAC, MAC_KEY_SIZE);
+
+  if (!saveVaultWithSalt(newSalt)) {
+    memcpy(encryptionKey, oldAES, AES_KEY_SIZE);
+    memcpy(macKey, oldMAC, MAC_KEY_SIZE);
+    memcpy(activeSalt, oldSalt, SALT_SIZE);
+    memset(newSalt, 0, sizeof(newSalt));
+    memset(newAES, 0, sizeof(newAES));
+    memset(newMAC, 0, sizeof(newMAC));
+    return false;
+  }
+  memcpy(activeSalt, newSalt, SALT_SIZE);
+  memset(oldAES, 0, sizeof(oldAES));
+  memset(oldMAC, 0, sizeof(oldMAC));
+  memset(oldSalt, 0, sizeof(oldSalt));
+  memset(newAES, 0, sizeof(newAES));
+  memset(newMAC, 0, sizeof(newMAC));
+  memset(newSalt, 0, sizeof(newSalt));
+  return true;
+}
+
+void webChangeMaster() {
+  if (!requireAuth()) return;
+  String h = htmlHeader("Мастер-пароль");
+  h += F("<div class='card'><h1>Смена мастер-пароля</h1>"
+         "<p class='muted'>Vault будет полностью перешифрован новым ключом и новой солью.</p>");
+  if (server.hasArg("err"))
+    h += F("<p class='error'>Пароли не совпадают или слишком короткие.</p>");
+  h += F("<form method='POST' action='/change-master'>"
+         "<input type='password' name='password' placeholder='Новый мастер-пароль' required>"
+         "<input type='password' name='confirm' placeholder='Повторите пароль' required>"
+         "<input type='hidden' name='csrf' value='");
+  h += webToken;
+  h += F("'><button class='primary'>Изменить</button></form></div>"
+         "<a class='btn' href='/settings'>← Назад</a>");
+  h += htmlFooter();
+  server.send(200, "text/html", h);
+}
+
+void webChangeMasterPost() {
+  if (!requireAuth()) return;
+  if (!checkCSRF()) return;
+  String p1 = server.arg("password");
+  String p2 = server.arg("confirm");
+  if (p1.length() < 8 || p1.length() > 64 || p1 != p2) {
+    redirectTo("/change-master?err=1"); return;
+  }
+  if (!changeMasterPassword(p1.c_str(), p1.length())) {
+    server.send(500, "text/plain", "Could not re-encrypt vault"); return;
+  }
+  webToken = randomHexToken(SESSION_BYTES);
+  setSessionCookie();
+  redirectTo("/");
+}
+
+// ============================================================
+// SETTINGS
+// ============================================================
+
+void webSettings() {
+  if (!requireAuth()) return;
+  size_t used = LittleFS.usedBytes();
+  size_t total = LittleFS.totalBytes();
+
+  String h = htmlHeader("Настройки");
+  h += F("<div class='card'><h1>Настройки</h1><div class='stat'><span>Автоблокировка</span><b>");
+  h += String(config.autoLockSeconds);
+  h += F(" сек.</b></div><div class='stat'><span>Flash</span><b>");
+  h += String(used / 1024);
+  h += F(" / ");
+  h += String(total / 1024);
+  h += F(" КБ</b></div></div>"
+         "<div class='card'><h2>Безопасность</h2>"
+         "<a class='btn' href='/change-master'>Сменить мастер-пароль</a></div>"
+         "<div class='card'><h2>Backup</h2>"
+         "<p class='muted'>Скачать зашифрованный vault.bin.</p>"
+         "<a class='btn primary' href='/backup'>Скачать backup</a></div>"
+         "<div class='card'><h2>Restore</h2>"
+         "<p class='muted'>Restore заменит текущий vault.</p>"
+         "<form method='POST' action='/restore' enctype='multipart/form-data'>"
+         "<input type='file' name='backup' required>"
+         "<input type='password' name='backupPassword' placeholder='Мастер-пароль backup' required>"
+         "<input type='hidden' name='csrf' value='");
+  h += webToken;
+  h += F("'><button class='danger'>Восстановить</button></form></div>"
+         "<a class='btn' href='/'>← Назад</a>");
+  h += htmlFooter();
+  server.send(200, "text/html", h);
+}
+
+// ============================================================
+// BACKUP / RESTORE
+// ============================================================
+
+void webBackup() {
+  if (!requireAuth()) return;
+  File f = LittleFS.open(VAULT_FILE, FILE_READ);
+  if (!f) { server.send(500, "text/plain", "Vault unavailable"); return; }
+  server.sendHeader("Content-Disposition",
+    "attachment; filename=\"vault-backup.bin\"");
+  server.streamFile(f, "application/octet-stream");
+  f.close();
+}
+
+File restoreUpload;
+bool restoreUploadStarted = false;
+
+void handleRestoreUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    restoreUploadStarted = true;
+    LittleFS.remove("/restore.tmp");
+    restoreUpload = LittleFS.open("/restore.tmp", FILE_WRITE);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (restoreUpload) restoreUpload.write(upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (restoreUpload) { restoreUpload.flush(); restoreUpload.close(); }
+    restoreUploadStarted = false;
+  }
+}
+
+bool restoreVaultFromFile(const String& password) {
+  File f = LittleFS.open("/restore.tmp", FILE_READ);
+  if (!f) return false;
+  VaultHeader header;
+  if (f.read((uint8_t*)&header, sizeof(header)) != sizeof(header)) { f.close(); return false; }
+  if (header.magic != VAULT_MAGIC || header.version != VAULT_VERSION ||
+      header.dataLen == 0 || header.dataLen > 65536 || header.dataLen % 16) {
+    f.close(); return false;
+  }
+  size_t totalSize = sizeof(VaultHeader) + header.dataLen + MAC_SIZE;
+  if (f.size() != totalSize) { f.close(); return false; }
+
+  uint8_t* encrypted = (uint8_t*)malloc(header.dataLen);
+  if (!encrypted) { f.close(); return false; }
+  if (f.read(encrypted, header.dataLen) != header.dataLen) {
+    free(encrypted); f.close(); return false;
+  }
+  uint8_t storedMac[MAC_SIZE];
+  if (f.read(storedMac, MAC_SIZE) != MAC_SIZE) {
+    free(encrypted); f.close(); return false;
+  }
+  f.close();
+
+  uint8_t newAES[AES_KEY_SIZE], newMAC[MAC_KEY_SIZE];
+  if (!deriveKeys(password, header.salt, newAES, newMAC)) {
+    free(encrypted); return false;
+  }
+
+  uint8_t savedMacKey[MAC_KEY_SIZE];
+  memcpy(savedMacKey, macKey, MAC_KEY_SIZE);
+  memcpy(macKey, newMAC, MAC_KEY_SIZE);
+
+  uint8_t calculatedMac[MAC_SIZE];
+  bool macOk = calculateVaultMac(header, encrypted, header.dataLen, calculatedMac);
+  if (!macOk || !constantTimeEquals(storedMac, calculatedMac, MAC_SIZE)) {
+    memcpy(macKey, savedMacKey, MAC_KEY_SIZE);
+    memset(savedMacKey, 0, sizeof(savedMacKey));
+    free(encrypted); return false;
+  }
+  memcpy(encryptionKey, newAES, AES_KEY_SIZE);
+  memcpy(macKey, newMAC, MAC_KEY_SIZE);
+  memset(savedMacKey, 0, sizeof(savedMacKey));
+
+  uint8_t* plain = (uint8_t*)malloc(header.dataLen);
+  if (!plain) { free(encrypted); return false; }
+  if (!aesDecrypt(encrypted, plain, header.dataLen, encryptionKey, header.iv)) {
+    memset(plain, 0, header.dataLen);
+    free(encrypted); free(plain); return false;
+  }
+  size_t plainLen = header.dataLen;
+  if (!removePadding(plain, plainLen) || plainLen != sizeof(VaultData)) {
+    memset(plain, 0, header.dataLen);
+    free(encrypted); free(plain); return false;
+  }
+  VaultData imported;
+  memcpy(&imported, plain, sizeof(imported));
+  if (imported.magic != VAULT_MAGIC || imported.version != VAULT_VERSION ||
+      imported.count > MAX_RECORDS) {
+    memset(&imported, 0, sizeof(imported));
+    memset(plain, 0, header.dataLen);
+    free(encrypted); free(plain); return false;
+  }
+
+  LittleFS.remove("/restore.valid");
+  File out = LittleFS.open("/restore.valid", FILE_WRITE);
+  if (!out) {
+    memset(plain, 0, header.dataLen);
+    free(encrypted); free(plain); return false;
+  }
+  out.write((uint8_t*)&header, sizeof(header));
+  out.write(encrypted, header.dataLen);
+  out.write(storedMac, MAC_SIZE);
+  out.flush(); out.close();
+
+  LittleFS.remove(VAULT_FILE);
+  if (!LittleFS.rename("/restore.valid", VAULT_FILE)) return false;
+
+  memcpy(&vault, &imported, sizeof(vault));
+  memcpy(activeSalt, header.salt, SALT_SIZE);
+
+  memset(&imported, 0, sizeof(imported));
+  memset(newAES, 0, sizeof(newAES));
+  memset(newMAC, 0, sizeof(newMAC));
+  memset(plain, 0, header.dataLen);
+  free(encrypted); free(plain);
+  LittleFS.remove("/restore.tmp");
+  return true;
+}
+
+void webRestorePost() {
+  if (!requireAuth()) return;
+  if (!checkCSRF()) return;
+  String backupPassword = server.arg("backupPassword");
+  if (!restoreUploadStarted && !LittleFS.exists("/restore.tmp")) {
+    server.send(400, "text/plain", "No backup uploaded"); return;
+  }
+  if (!restoreVaultFromFile(backupPassword)) {
+    LittleFS.remove("/restore.tmp");
+    server.send(400, "text/plain", "Invalid backup or password"); return;
+  }
+  webToken = randomHexToken(SESSION_BYTES);
+  setSessionCookie();
+  redirectTo("/");
+}
+
+// ============================================================
+// LOCK WEB  —  FIX: send response BEFORE stopping state
+// ============================================================
+
+void webLock() {
+  if (!checkSession()) { redirectTo("/"); return; }
+  if (!checkCSRF()) return;
+
+  // Send redirect first, then lock.
+  clearSessionCookie();
+  redirectTo("/");
+
+  // Small delay ensures WebServer flushes the response.
+  delay(50);
+  lockVault();
+}
+
+// ============================================================
+// WEB SERVER
+// ============================================================
+
+void startWebServer() {
+  const char* headerKeys[] = {"Cookie"};
+  server.collectHeaders(headerKeys, 1);
+
+  server.on("/", HTTP_GET, webHome);
+  server.on("/setup", HTTP_GET, webSetup);
+  server.on("/setup", HTTP_POST, webSetupPost);
+  server.on("/unlock", HTTP_POST, webUnlockPost);
+  server.on("/add", HTTP_GET, webAdd);
+  server.on("/add", HTTP_POST, webAddPost);
+  server.on("/view", HTTP_GET, webView);
+  server.on("/edit", HTTP_GET, webEdit);
+  server.on("/edit", HTTP_POST, webEditPost);
+  server.on("/delete", HTTP_POST, webDeletePost);
+  server.on("/search", HTTP_GET, webSearch);
+  server.on("/generator", HTTP_GET, webGenerator);
+  server.on("/settings", HTTP_GET, webSettings);
+  server.on("/change-master", HTTP_GET, webChangeMaster);
+  server.on("/change-master", HTTP_POST, webChangeMasterPost);
+  server.on("/backup", HTTP_GET, webBackup);
+  server.on("/restore", HTTP_POST, webRestorePost, handleRestoreUpload);
+  server.on("/lock", HTTP_POST, webLock);
+
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.begin();
+  Serial.println("[WEB] Server started");
+}
+
+// ============================================================
+// WIFI
+// ============================================================
+
+void startWiFi() {
+  apSsid = "VAULT-" + String((uint32_t)ESP.getEfuseMac(), HEX).substring(4);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apSsid.c_str(), config.apPassword);
+  Serial.println();
+  Serial.println("[WIFI] VAULT AP");
+  Serial.print("[WIFI] SSID: "); Serial.println(apSsid);
+  Serial.print("[WIFI] PASSWORD: "); Serial.println(config.apPassword);
+  Serial.print("[WIFI] IP: "); Serial.println(WiFi.softAPIP());
+}
+
+// ============================================================
+// OLED HELPERS
+// ============================================================
+
+void header(const String& title) {
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.drawStr(0, 9, title.c_str());
+  oled.drawHLine(0, 12, 128);
+}
+
+void showBoot() {
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_7x14B_tf);
+  oled.drawStr(29, 27, "VAULT");
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.drawStr(35, 43, "OS 0.7");
+  oled.sendBuffer();
+  delay(900);
+}
+
+void drawMenu(const char* title, const char* items[],
+              int count, int selected) {
+  oled.clearBuffer();
+  header(title);
+  oled.setFont(u8g2_font_6x10_tf);
+  int first = selected - 1;
+  if (first < 0) first = 0;
+  if (first > count - 4) first = max(0, count - 4);
+  for (int i = 0; i < 4; i++) {
+    int idx = first + i;
+    if (idx >= count) break;
+    int y = 24 + i * 10;
+    if (idx == selected) {
+      oled.drawBox(0, y - 8, 128, 10);
+      oled.setDrawColor(0);
+    }
+    oled.drawStr(4, y, items[idx]);
+    oled.setDrawColor(1);
+  }
+  oled.sendBuffer();
+}
+
+// ============================================================
+// LOCKED SCREEN
+// ============================================================
+
+void showLocked() {
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_7x14B_tf);
+  oled.drawStr(30, 24, "VAULT");
+  oled.setFont(u8g2_font_6x10_tf);
+
+  char buf[24];
+  if (lockoutUntil > millis()) {
+    unsigned long s = (lockoutUntil - millis() + 999) / 1000;
+    snprintf(buf, sizeof(buf), "WAIT %lus", s);
+    oled.drawStr(39, 43, buf);
+  } else {
+    oled.drawStr(36, 43, "R7 ENTER");
+  }
+  oled.drawStr(18, 57, "R5/R6 UP/DOWN");
+  oled.sendBuffer();
+}
+
+// ============================================================
+// EDITOR WITH CURSOR
+// ============================================================
+
+void resetEditor(EditTarget target) {
+  memset(editorBuffer, 0, sizeof(editorBuffer));
+  editorLen = 0;
+  editorCursor = 0;
+  editorCharset = 0;
+  editorCharIndex = 0;
+  editorTarget = target;
+}
+
+void editorInsertChar(char c) {
+  if (editorLen >= MAX_EDITOR) return;
+  if (editorCursor < 0) editorCursor = 0;
+  if (editorCursor > editorLen) editorCursor = editorLen;
+  for (int i = editorLen; i > editorCursor; i--)
+    editorBuffer[i] = editorBuffer[i - 1];
+  editorBuffer[editorCursor] = c;
+  editorLen++;
+  editorCursor++;
+  editorBuffer[editorLen] = 0;
+}
+
+void editorDeleteChar() {
+  if (editorLen == 0) return;
+  if (editorCursor <= 0) return;
+  for (int i = editorCursor - 1; i < editorLen - 1; i++)
+    editorBuffer[i] = editorBuffer[i + 1];
+  editorLen--;
+  editorCursor--;
+  editorBuffer[editorLen] = 0;
+}
+
+void editorDraw(const char* title, bool hide) {
+  oled.clearBuffer();
+  header(title);
+  oled.setFont(u8g2_font_6x10_tf);
+
+  // Show up to 20 chars, scrolled so cursor is visible.
+  int viewStart = 0;
+  const int VIEW = 20;
+  if (editorCursor > VIEW - 1) viewStart = editorCursor - VIEW + 1;
+
+  char line[24];
+  int n = 0;
+  for (int i = viewStart; i < editorLen && n < VIEW; i++) {
+    line[n++] = hide ? '*' : editorBuffer[i];
+  }
+  line[n] = 0;
+  oled.drawStr(2, 25, line);
+  oled.drawHLine(0, 28, 128);
+
+  // Cursor indicator: position of cursor inside view
+  int curView = editorCursor - viewStart;
+  int curX = 2 + curView * 6;
+  if (curX < 0) curX = 0;
+  if (curX > 126) curX = 126;
+  oled.drawBox(curX, 29, 6, 2);
+
+  // Current char being edited
+  oled.setFont(u8g2_font_7x14B_tf);
+  char c[2];
+  c[0] = CHARSET_GROUPS[editorCharset][editorCharIndex];
+  c[1] = 0;
+  oled.drawStr(4, 47, c);
+
+  oled.setFont(u8g2_font_6x10_tf);
+  char setLine[24];
+  snprintf(setLine, sizeof(setLine), "set: %s", CHARSET_LABELS[editorCharset]);
+  oled.drawStr(28, 46, setLine);
+
+  oled.drawStr(2, 57, "R5/R6 char  R7 add");
+  oled.drawStr(2, 63, "holdR7 next R8 del");
+
+  oled.sendBuffer();
+}
+
+void showEditor() {
+  const char* title = "EDIT";
+  bool hide = false;
+
+  switch (editorTarget) {
+    case EDIT_MASTER:         title = "MASTER";   hide = true;  break;
+    case EDIT_MASTER_CONFIRM: title = "REPEAT";   hide = true;  break;
+    case EDIT_NAME:           title = "SERVICE";  hide = false; break;
+    case EDIT_USERNAME:       title = "USERNAME"; hide = false; break;
+    case EDIT_PASSWORD:       title = "PASSWORD"; hide = true;  break;
+    case EDIT_NOTE:           title = "NOTE";     hide = false; break;
+    case EDIT_SEARCH:         title = "SEARCH";   hide = false; break;
+    default: break;
+  }
+  editorDraw(title, hide);
+}
+
+// ============================================================
+// ADD / EDIT FLOW
+// ============================================================
+
+void beginAdd() {
+  editRecordIndex = -1;
+  editField = 0;
+  resetEditor(EDIT_NAME);
+  currentScreen = SCREEN_ADD;
+}
+
+void beginEdit(int index) {
+  if (index < 0 || index >= vault.count) return;
+  editRecordIndex = index;
+  editField = 0;
+  resetEditor(EDIT_NAME);
+  strlcpy(editorBuffer, vault.records[index].name, sizeof(editorBuffer));
+  editorLen = strlen(editorBuffer);
+  editorCursor = editorLen;
+  currentScreen = SCREEN_EDIT;
+}
+
+void addOrEditNextField() {
+  if (editRecordIndex >= 0) {
+    VaultRecord &r = vault.records[editRecordIndex];
+    switch (editField) {
+      case 0: strlcpy(r.name,     editorBuffer, MAX_NAME); break;
+      case 1: strlcpy(r.username, editorBuffer, MAX_USER); break;
+      case 2: strlcpy(r.password, editorBuffer, MAX_PASS); break;
+      case 3: strlcpy(r.note,     editorBuffer, MAX_NOTE); break;
+    }
+  } else {
+    if (editField == 0) {
+      memset(&vault.records[vault.count], 0, sizeof(VaultRecord));
+      vault.records[vault.count].type = RECORD_PASSWORD;
+      strlcpy(vault.records[vault.count].name, editorBuffer, MAX_NAME);
+    } else {
+      VaultRecord &r = vault.records[vault.count];
+      switch (editField) {
+        case 1: strlcpy(r.username, editorBuffer, MAX_USER); break;
+        case 2: strlcpy(r.password, editorBuffer, MAX_PASS); break;
+        case 3: strlcpy(r.note,     editorBuffer, MAX_NOTE); break;
+      }
+    }
+  }
+
+  editField++;
+  if (editField >= 4) {
+    if (editRecordIndex < 0) {
+      vault.count++;
+      if (!saveCurrentVault()) { vault.count--; return; }
+    } else {
+      if (!saveCurrentVault()) return;
+    }
+    currentScreen = SCREEN_HOME;
+    return;
+  }
+
+  switch (editField) {
+    case 0:
+      resetEditor(EDIT_NAME);
+      if (editRecordIndex >= 0)
+        strlcpy(editorBuffer, vault.records[editRecordIndex].name, sizeof(editorBuffer));
+      break;
+    case 1:
+      resetEditor(EDIT_USERNAME);
+      if (editRecordIndex >= 0)
+        strlcpy(editorBuffer, vault.records[editRecordIndex].username, sizeof(editorBuffer));
+      break;
+    case 2:
+      resetEditor(EDIT_PASSWORD);
+      if (editRecordIndex >= 0)
+        strlcpy(editorBuffer, vault.records[editRecordIndex].password, sizeof(editorBuffer));
+      break;
+    case 3:
+      resetEditor(EDIT_NOTE);
+      if (editRecordIndex >= 0)
+        strlcpy(editorBuffer, vault.records[editRecordIndex].note, sizeof(editorBuffer));
+      break;
+  }
+  editorLen = strlen(editorBuffer);
+  editorCursor = editorLen;
+}
+
+// ============================================================
+// LIST / RECORD
+// ============================================================
+
+void showList() {
+  oled.clearBuffer();
+  header(searchCount ? "SEARCH" : "PASSWORDS");
+  oled.setFont(u8g2_font_6x10_tf);
+  int count = searchCount ? searchCount : vault.count;
+
+  if (!count) {
+    oled.drawStr(34, 35, "NO RECORDS");
+    oled.drawStr(44, 53, "R8 BACK");
+    oled.sendBuffer();
+    return;
+  }
+
+  int first = selectedRecord - 1;
+  if (first < 0) first = 0;
+  if (first > count - 4) first = max(0, count - 4);
+
+  for (int i = 0; i < 4; i++) {
+    int idx = first + i;
+    if (idx >= count) break;
+    int actual = searchCount ? searchResults[idx] : idx;
+    if (idx == selectedRecord) {
+      oled.drawBox(0, 16 + i * 11, 128, 11);
+      oled.setDrawColor(0);
+    }
+    oled.drawStr(3, 25 + i * 11, vault.records[actual].name);
+    oled.setDrawColor(1);
+  }
+  oled.sendBuffer();
+}
+
+void showRecord() {
+  if (selectedRecord < 0 || selectedRecord >= vault.count) {
+    currentScreen = SCREEN_LIST; return;
+  }
+  VaultRecord &r = vault.records[selectedRecord];
+  oled.clearBuffer();
+  header(String(r.name));
+  oled.setFont(u8g2_font_6x10_tf);
+
+  oled.drawStr(2, 25, "USER:");
+  char u[20];
+  strlcpy(u, r.username, sizeof(u));
+  oled.drawStr(35, 25, u);
+
+  oled.drawStr(2, 37, "PASS:");
+  char p[20];
+  if (recordPasswordVisible) {
+    strlcpy(p, r.password, sizeof(p));
+  } else {
+    int n = strlen(r.password);
+    if (n > 18) n = 18;
+    for (int i = 0; i < n; i++) p[i] = '*';
+    p[n] = 0;
+  }
+  oled.drawStr(35, 37, p);
+
+  oled.drawStr(2, 51, "R7 SHOW/HIDE");
+  oled.drawStr(82, 62, "R8 BACK");
+  oled.sendBuffer();
+}
+
+// ============================================================
+// GENERATOR SCREEN
+// ============================================================
+
+void showGenerator() {
+  oled.clearBuffer();
+  header("GENERATOR");
+  oled.setFont(u8g2_font_6x10_tf);
+
+  char l1[24], l2[24];
+  strlcpy(l1, generatedPassword, sizeof(l1));
+  oled.drawStr(2, 27, l1);
+  if (strlen(generatedPassword) > 20) {
+    strlcpy(l2, generatedPassword + 20, sizeof(l2));
+    oled.drawStr(2, 39, l2);
+  }
+
+  char st[24];
+  snprintf(st, sizeof(st), "LEN %d  %s",
+           generatorLength, generatorLabels[generatorMode]);
+  oled.drawStr(2, 51, st);
+  oled.drawStr(2, 62, "R5/R6 len R7 new");
+  oled.sendBuffer();
+}
+
+// ============================================================
+// SETTINGS SCREEN
+// ============================================================
+
+const char* settingsItems[] = {"CHANGE MASTER", "AUTO LOCK", "LOCK"};
+
+void showSettings() {
+  drawMenu("SETTINGS", settingsItems, 3, menuIndex);
+}
+
+// ============================================================
+// CHANGE MASTER (device)
+// ============================================================
+
+void startChangeMaster() {
+  resetEditor(EDIT_MASTER);
+  currentScreen = SCREEN_CHANGE_MASTER;
+}
+
+void handleChangeMasterEnter() {
+  if (editorTarget == EDIT_MASTER) {
+    memcpy(confirmMasterBuffer, editorBuffer, editorLen);
+    confirmMasterBuffer[editorLen] = 0;
+    resetEditor(EDIT_MASTER_CONFIRM);
+    return;
+  }
+  if (editorTarget == EDIT_MASTER_CONFIRM) {
+    if (strcmp(confirmMasterBuffer, editorBuffer) != 0) {
+      // mismatch — restart
+      memset(confirmMasterBuffer, 0, sizeof(confirmMasterBuffer));
+      resetEditor(EDIT_MASTER);
+      return;
+    }
+    if (!changeMasterPassword(confirmMasterBuffer, strlen(confirmMasterBuffer))) {
+      memset(confirmMasterBuffer, 0, sizeof(confirmMasterBuffer));
+      resetEditor(EDIT_MASTER);
+      return;
+    }
+    memset(confirmMasterBuffer, 0, sizeof(confirmMasterBuffer));
+    resetEditor(EDIT_NONE);
+    currentScreen = SCREEN_SETTINGS;
+  }
+}
+
+// ============================================================
+// SEARCH (device)
+// ============================================================
+
+void buildSearchResults() {
+  searchCount = 0;
+  char q[MAX_EDITOR + 1];
+  strlcpy(q, searchBuffer, sizeof(q));
+  for (char* p = q; *p; p++) *p = tolower(*p);
+
+  for (int i = 0; i < vault.count && searchCount < MAX_RECORDS; i++) {
+    char n[MAX_NAME], u[MAX_USER];
+    strlcpy(n, vault.records[i].name, sizeof(n));
+    strlcpy(u, vault.records[i].username, sizeof(u));
+    for (char* p = n; *p; p++) *p = tolower(*p);
+    for (char* p = u; *p; p++) *p = tolower(*p);
+
+    if (strlen(q) == 0 || strstr(n, q) || strstr(u, q))
+      searchResults[searchCount++] = i;
+  }
+  selectedRecord = 0;
+}
+
+// ============================================================
+// HOME
+// ============================================================
+
+const char* homeItems[] = {
+  "PASSWORDS", "SEARCH", "ADD PASSWORD",
+  "GENERATOR", "SETTINGS", "LOCK"
+};
+
+void showHome() {
+  drawMenu("VAULT", homeItems, 6, menuIndex);
+}
+
+// ============================================================
+// SETUP SCREEN
+// ============================================================
+
+void showSetup() {
+  oled.clearBuffer();
+  header("SETUP");
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.drawStr(2, 24, "WiFi:");
+  oled.drawStr(2, 35, apSsid.c_str());
+  oled.drawStr(2, 46, "PASS:");
+  oled.drawStr(35, 46, config.apPassword);
+  oled.drawStr(16, 59, "192.168.4.1");
+  oled.sendBuffer();
+}
+
+// ============================================================
+// EDITOR BUTTON HANDLING
+// ============================================================
+
+void handleEditorButtons(ButtonEvent up, ButtonEvent down,
+                         ButtonEvent enter, ButtonEvent back) {
+  const char* set = CHARSET_GROUPS[editorCharset];
+  int setLen = strlen(set);
+
+  // Character wheel: R5=prev, R6=next
+  if (up == BTN_SHORT)
+    editorCharIndex = (editorCharIndex - 1 + setLen) % setLen;
+  if (down == BTN_SHORT)
+    editorCharIndex = (editorCharIndex + 1) % setLen;
+
+  // Charset switch: long press
+  if (up == BTN_LONG) {
+    editorCharset = (editorCharset - 1 + 4) % 4;
+    editorCharIndex = 0;
+  }
+  if (down == BTN_LONG) {
+    editorCharset = (editorCharset + 1) % 4;
+    editorCharIndex = 0;
+  }
+
+  // Insert char: R7 short
+  if (enter == BTN_SHORT)
+    editorInsertChar(CHARSET_GROUPS[editorCharset][editorCharIndex]);
+
+  // Delete char: R8 short
+  if (back == BTN_SHORT)
+    editorDeleteChar();
+
+  // R7 long = accept (handled by caller)
+  // R8 long = cancel (handled by caller)
+}
+
+// ============================================================
+// BUTTON MAIN
+// ============================================================
+
+void handleButtons() {
+  ButtonEvent up    = pollButton(PIN_R5, bR5);
+  ButtonEvent down  = pollButton(PIN_R6, bR6);
+  ButtonEvent enter = pollButton(PIN_R7, bR7);
+  ButtonEvent back  = pollButton(PIN_R8, bR8);
+
+  if (up == BTN_NONE && down == BTN_NONE &&
+      enter == BTN_NONE && back == BTN_NONE) return;
+
+  lastActivity = millis();
+
+  // ---------------- LOCKED ----------------
+  if (currentScreen == SCREEN_LOCKED) {
+    if (enter == BTN_SHORT && millis() >= lockoutUntil) {
+      resetEditor(EDIT_MASTER);
+      currentScreen = SCREEN_UNLOCK;
+    }
+    return;
+  }
+
+  // ---------------- UNLOCK ----------------
+  if (currentScreen == SCREEN_UNLOCK) {
+    handleEditorButtons(up, down, enter, back);
+    if (enter == BTN_LONG) {
+      UnlockResult r = attemptUnlock(editorBuffer, editorLen);
+      memset(editorBuffer, 0, sizeof(editorBuffer));
+      editorLen = 0;
+      editorCursor = 0;
+      if (r.ok) {
+        currentScreen = SCREEN_HOME;
+        menuIndex = 0;
+      } else {
+        currentScreen = SCREEN_LOCKED;
+      }
+    }
+    if (back == BTN_LONG) {
+      memset(editorBuffer, 0, sizeof(editorBuffer));
+      editorLen = 0; editorCursor = 0;
+      currentScreen = SCREEN_LOCKED;
+    }
+    return;
+  }
+
+  // ---------------- ADD / EDIT ----------------
+  if (currentScreen == SCREEN_ADD || currentScreen == SCREEN_EDIT) {
+    handleEditorButtons(up, down, enter, back);
+    if (enter == BTN_LONG) addOrEditNextField();
+    if (back == BTN_LONG) {
+      memset(editorBuffer, 0, sizeof(editorBuffer));
+      editorLen = 0; editorCursor = 0;
+      currentScreen = SCREEN_HOME;
+    }
+    return;
+  }
+
+  // ---------------- SEARCH ----------------
+  if (currentScreen == SCREEN_SEARCH) {
+    handleEditorButtons(up, down, enter, back);
+    if (enter == BTN_LONG) {
+      memset(searchBuffer, 0, sizeof(searchBuffer));
+      memcpy(searchBuffer, editorBuffer, editorLen);
+      searchBuffer[editorLen] = 0;
+      buildSearchResults();
+      currentScreen = SCREEN_LIST;
+    }
+    if (back == BTN_LONG) {
+      currentScreen = SCREEN_HOME;
+    }
+    return;
+  }
+
+  // ---------------- CHANGE MASTER ----------------
+  if (currentScreen == SCREEN_CHANGE_MASTER) {
+    handleEditorButtons(up, down, enter, back);
+    if (enter == BTN_LONG) handleChangeMasterEnter();
+    if (back == BTN_LONG) {
+      memset(confirmMasterBuffer, 0, sizeof(confirmMasterBuffer));
+      resetEditor(EDIT_NONE);
+      currentScreen = SCREEN_SETTINGS;
+    }
+    return;
+  }
+
+  // ---------------- HOME ----------------
+  if (currentScreen == SCREEN_HOME) {
+    if (up == BTN_SHORT) { if (menuIndex > 0) menuIndex--; }
+    else if (down == BTN_SHORT) { if (menuIndex < 5) menuIndex++; }
+    else if (enter == BTN_SHORT) {
+      switch (menuIndex) {
+        case 0: searchCount = 0; selectedRecord = 0;
+                currentScreen = SCREEN_LIST; break;
+        case 1: resetEditor(EDIT_SEARCH); currentScreen = SCREEN_SEARCH; break;
+        case 2: if (vault.count < MAX_RECORDS) beginAdd(); break;
+        case 3: generatorLength = 24; generatorMode = 0;
+                newGeneratedPassword(); currentScreen = SCREEN_GENERATOR; break;
+        case 4: menuIndex = 0; currentScreen = SCREEN_SETTINGS; break;
+        case 5: lockVault(); break;
+      }
+    }
+    return;
+  }
+
+  // ---------------- LIST ----------------
+  if (currentScreen == SCREEN_LIST) {
+    int count = searchCount ? searchCount : vault.count;
+    if (up == BTN_SHORT && selectedRecord > 0) selectedRecord--;
+    else if (down == BTN_SHORT && selectedRecord < count - 1) selectedRecord++;
+    else if (enter == BTN_SHORT && count > 0) {
+      if (searchCount) selectedRecord = searchResults[selectedRecord];
+      recordPasswordVisible = false;
+      currentScreen = SCREEN_RECORD;
+    } else if (back == BTN_SHORT) {
+      currentScreen = SCREEN_HOME;
+    }
+    return;
+  }
+
+  // ---------------- RECORD ----------------
+  if (currentScreen == SCREEN_RECORD) {
+    if (enter == BTN_SHORT) recordPasswordVisible = !recordPasswordVisible;
+    else if (enter == BTN_LONG) beginEdit(selectedRecord);
+    else if (back == BTN_SHORT) currentScreen = SCREEN_LIST;
+    return;
+  }
+
+  // ---------------- GENERATOR ----------------
+  if (currentScreen == SCREEN_GENERATOR) {
+    if (up == BTN_SHORT && generatorLength < 95) generatorLength++;
+    else if (down == BTN_SHORT && generatorLength > 8) generatorLength--;
+    else if (enter == BTN_SHORT) newGeneratedPassword();
+    else if (enter == BTN_LONG) {
+      generatorMode = (generatorMode + 1) % 4;
+      newGeneratedPassword();
+    } else if (back == BTN_SHORT) currentScreen = SCREEN_HOME;
+    return;
+  }
+
+  // ---------------- SETTINGS ----------------
+  if (currentScreen == SCREEN_SETTINGS) {
+    if (up == BTN_SHORT && menuIndex > 0) menuIndex--;
+    else if (down == BTN_SHORT && menuIndex < 2) menuIndex++;
+    else if (enter == BTN_SHORT) {
+      switch (menuIndex) {
+        case 0: startChangeMaster(); break;
+        case 1:
+          if (config.autoLockSeconds == 60) config.autoLockSeconds = 120;
+          else if (config.autoLockSeconds == 120) config.autoLockSeconds = 300;
+          else config.autoLockSeconds = 60;
+          saveConfig();
+          break;
+        case 2: lockVault(); break;
+      }
+    } else if (back == BTN_SHORT) {
+      currentScreen = SCREEN_HOME;
+    }
+    return;
+  }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(400);
+  Serial.println();
+  Serial.println("======================");
+  Serial.println("VAULT OS 0.7");
+  Serial.println("======================");
+
+  Wire.begin(PIN_SDA, PIN_SCL);
+  oled.begin();
+  oled.clearBuffer();
+  oled.sendBuffer();
+
+  pinMode(PIN_R5, INPUT_PULLUP);
+  pinMode(PIN_R6, INPUT_PULLUP);
+  pinMode(PIN_R7, INPUT_PULLUP);
+  pinMode(PIN_R8, INPUT_PULLUP);
+
+  showBoot();
+
+  if (!LittleFS.begin(true)) {
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_6x10_tf);
+    oled.drawStr(5, 32, "FILESYSTEM ERROR");
+    oled.sendBuffer();
+    while (true) delay(1000);
+  }
+  Serial.println("[FS] OK");
+
+  if (!loadConfig()) {
+    memset(&config, 0, sizeof(config));
+    config.magic = CONFIG_MAGIC;
+    config.version = CONFIG_VERSION;
+    config.autoLockSeconds = AUTO_LOCK_DEFAULT;
+    String ap = generateApPassword();
+    strlcpy(config.apPassword, ap.c_str(), sizeof(config.apPassword));
+    if (!saveConfig()) Serial.println("[CONFIG] save failed");
+  } else {
+    Serial.println("[CONFIG] loaded");
+  }
+
+  startWiFi();
+  startWebServer();
+
+  if (LittleFS.exists(VAULT_FILE)) {
+    currentScreen = SCREEN_LOCKED;
+    showLocked();
+  } else {
+    currentScreen = SCREEN_SETUP;
+    showSetup();
+  }
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+  server.handleClient();
+
+  if (vaultUnlocked && config.autoLockSeconds > 0 &&
+      millis() - lastActivity > config.autoLockSeconds * 1000UL) {
+    Serial.println("[VAULT] Auto-lock");
+    lockVault();
+  }
+
+  handleButtons();
+
+  switch (currentScreen) {
+    case SCREEN_SETUP:         showSetup();         break;
+    case SCREEN_LOCKED:        showLocked();        break;
+    case SCREEN_UNLOCK:        showEditor();        break;
+    case SCREEN_HOME:          showHome();          break;
+    case SCREEN_LIST:          showList();          break;
+    case SCREEN_RECORD:        showRecord();        break;
+    case SCREEN_ADD:
+    case SCREEN_EDIT:
+    case SCREEN_SEARCH:
+    case SCREEN_CHANGE_MASTER: showEditor();        break;
+    case SCREEN_GENERATOR:     showGenerator();     break;
+    case SCREEN_SETTINGS:      showSettings();      break;
+    default: break;
+  }
+
+  delay(20);
+}
