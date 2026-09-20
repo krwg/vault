@@ -1,6 +1,6 @@
 /*
    ============================================================
-   VAULT OS 0.7
+   VAULT OS 0.8
    ESP32-C3 + OLED 128x64 + 4 buttons
    ============================================================
 
@@ -19,40 +19,47 @@
    R8  = GPIO 6
 
    ============================================================
-   CHANGES v0.7
+   CHANGES v0.8
    ============================================================
 
-   FIXED
-   - web lock no longer freezes WebServer
-   - loopTask stack raised to 16K (was causing reboot
-     after web unlock due to PBKDF2 + WebServer)
-   - device master-password entry now supports
-     cursor left/right, not only append/backspace
-   - settings / change-master / search / generator
-     rewritten and actually reachable
-   - all temp Strings removed from 20ms draw loop
-   - MAX_RECORDS lowered to 16 to reduce heap pressure
+   UI / UX
+   - Locked screen redesigned: shows SSID, AP password,
+     IP and a clear hint, so you can connect to the web
+     even without the vault being unlocked
+   - AP password visible on device (long R5 on Locked)
+   - full on-screen keyboard for all text input
+     (abc / ABC / 123 / #@!), cursor navigation with 4 buttons
+   - keyboard has action row: layout switch, backspace, accept
+   - unified editor for all fields: master, name, user,
+     password, note, search
 
-   DEVICE KEYBOARD
-   R5 short  = prev char
-   R5 long   = prev charset
-   R6 short  = next char
-   R6 long   = next charset
-   R7 short  = insert char
-   R7 long   = accept / next field
-   R8 short  = delete char (backspace at cursor)
-   R8 long   = cancel
+   WEB
+   - emoji removed
+   - Apple-style minimal UI (SF-like typography, soft cards,
+     subtle borders, muted palette)
+   - consistent spacing, rounded corners, focus rings
+   - light/dark aware via prefers-color-scheme
+   - reduced CSS, no external assets
 
-   SECURITY (unchanged from v0.6)
+   NEW FEATURE: TOTP (2FA) per record
+   - each record can hold a Base32 TOTP secret (RFC 6238)
+   - 6 digits, 30 s step, HMAC-SHA1
+   - code shown on device and in web UI, refreshes live
+   - HMAC-SHA1 taken from mbedtls (already linked)
+
+   FIXES
+   - web lock no longer freezes the server
+   - loop stack pressure reduced (no temp String in draw loop)
+   - MAX_RECORDS = 16
+
+   SECURITY (unchanged core)
    - AES-256-CBC + HMAC-SHA256 Encrypt-then-MAC
    - PBKDF2-HMAC-SHA256 -> 64 bytes
-   - MAC verified BEFORE decrypting
+   - MAC verified before decrypt
    - random salt in header, random IV per save
    - atomic writes via .tmp + rename
    - failed password backoff
-   - session cookie + CSRF
-   - HTML escaping
-   - random AP password
+   - session cookie + CSRF + HTML escaping
    - sensitive RAM wiped where practical
 */
 
@@ -68,6 +75,7 @@
 #include <mbedtls/pkcs5.h>
 
 #include <esp_system.h>
+#include <time.h>
 
 // ============================================================
 // HARDWARE
@@ -98,6 +106,7 @@ WebServer server(80);
 #define MAX_USER 64
 #define MAX_PASS 96
 #define MAX_NOTE 128
+#define MAX_TOTP 40
 
 #define MAX_EDITOR 64
 
@@ -107,11 +116,11 @@ WebServer server(80);
 #define CONFIG_FILE "/config.bin"
 #define CONFIG_TMP  "/config.tmp"
 
-#define VAULT_MAGIC   0x564C5437UL
-#define VAULT_VERSION 7
+#define VAULT_MAGIC   0x564C5438UL
+#define VAULT_VERSION 8
 
-#define CONFIG_MAGIC  0x43464737UL
-#define CONFIG_VERSION 7
+#define CONFIG_MAGIC  0x43464738UL
+#define CONFIG_VERSION 8
 
 #define PBKDF2_ITERATIONS 20000
 
@@ -122,7 +131,7 @@ WebServer server(80);
 #define DERIVED_KEY_SIZE 64
 #define MAC_SIZE 32
 
-#define AUTO_LOCK_DEFAULT 120
+#define AUTO_LOCK_DEFAULT 300
 
 #define SESSION_BYTES 24
 
@@ -142,6 +151,7 @@ struct VaultRecord {
   char username[MAX_USER];
   char password[MAX_PASS];
   char note[MAX_NOTE];
+  char totp[MAX_TOTP];
 };
 
 struct VaultData {
@@ -195,7 +205,8 @@ enum Screen {
   SCREEN_SEARCH,
   SCREEN_GENERATOR,
   SCREEN_SETTINGS,
-  SCREEN_CHANGE_MASTER
+  SCREEN_CHANGE_MASTER,
+  SCREEN_INFO
 };
 
 enum EditTarget {
@@ -206,6 +217,7 @@ enum EditTarget {
   EDIT_USERNAME,
   EDIT_PASSWORD,
   EDIT_NOTE,
+  EDIT_TOTP,
   EDIT_SEARCH
 };
 
@@ -235,13 +247,16 @@ Screen currentScreen = SCREEN_SETUP;
 int selectedRecord = 0;
 int menuIndex = 0;
 
-// Editor state
+// Editor
 char editorBuffer[MAX_EDITOR + 1];
 int editorLen = 0;
-int editorCursor = 0;          // <-- NEW: cursor position
-int editorCharset = 0;
-int editorCharIndex = 0;
+int editorCursor = 0;
 EditTarget editorTarget = EDIT_NONE;
+
+// Keyboard
+int kbdLayout = 0;      // 0=abc 1=ABC 2=123 3=sym
+int kbdRow = 0;         // 0..3
+int kbdCol = 0;         // 0..9 (rows 0..2), 0..5 (row 3)
 
 // Master confirm
 char confirmMasterBuffer[MAX_EDITOR + 1];
@@ -263,33 +278,54 @@ const char* generatorLabels[] = {
   "Aaz#"
 };
 
-// ADD/EDIT flow
+// ADD/EDIT
 int editRecordIndex = -1;
 int editField = 0;
 
 bool recordPasswordVisible = false;
 
+// TOTP live cache
+unsigned long lastTotpRefresh = 0;
+char currentTotp[8] = {0};
+
 // ============================================================
-// CHARSETS
+// KEYBOARD LAYOUTS
 // ============================================================
 
-const char* CHARSET_LOWER   = "abcdefghijklmnopqrstuvwxyz";
-const char* CHARSET_UPPER   = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-const char* CHARSET_DIGITS  = "0123456789";
-const char* CHARSET_SYMBOLS = "!@#$%^&*()-_=+[]{}.,:;?/";
-
-const char* CHARSET_GROUPS[] = {
-  CHARSET_LOWER,
-  CHARSET_UPPER,
-  CHARSET_DIGITS,
-  CHARSET_SYMBOLS
+const char* KBD_ROWS[4][3] = {
+  // abc
+  {
+    "abcdefghij",
+    "klmnopqrst",
+    "uvwxyz.,-_"
+  },
+  // ABC
+  {
+    "ABCDEFGHIJ",
+    "KLMNOPQRST",
+    "UVWXYZ.,-_"
+  },
+  // 123
+  {
+    "1234567890",
+    "!@#$%^&*()",
+    "-_=+[]{} /\\"
+  },
+  // sym
+  {
+    "!@#$%^&*()",
+    "-_=+[]{} /\\",
+    ".,:;?\"'`~|"
+  }
 };
 
-const char* CHARSET_LABELS[] = {
-  "abc",
-  "ABC",
-  "123",
-  "#@!"
+const char* KBD_LAYOUT_NAMES[4] = { "abc", "ABC", "123", "#@!" };
+
+// Action row (row 3): 6 buttons
+// 0: layout0  1: layout1  2: layout2  3: layout3
+// 4: backspace  5: accept
+const char* KBD_ACTION_LABELS[6] = {
+  "abc", "ABC", "123", "#@!", "<x", "OK"
 };
 
 // ============================================================
@@ -431,6 +467,15 @@ bool hmacSha256(const uint8_t* key, size_t keyLen,
   return mbedtls_md_hmac(md, key, keyLen, data, dataLen, output) == 0;
 }
 
+bool hmacSha1(const uint8_t* key, size_t keyLen,
+              const uint8_t* data, size_t dataLen,
+              uint8_t* output) {
+  const mbedtls_md_info_t* md =
+    mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
+  if (!md) return false;
+  return mbedtls_md_hmac(md, key, keyLen, data, dataLen, output) == 0;
+}
+
 // ============================================================
 // AES CBC
 // ============================================================
@@ -544,7 +589,7 @@ bool calculateVaultMac(const VaultHeader& header,
 }
 
 // ============================================================
-// SAVE VAULT
+// SAVE / LOAD VAULT
 // ============================================================
 
 bool saveVaultWithSalt(const uint8_t* salt) {
@@ -610,10 +655,6 @@ bool saveVaultWithSalt(const uint8_t* salt) {
 }
 
 bool saveCurrentVault() { return saveVaultWithSalt(activeSalt); }
-
-// ============================================================
-// LOAD VAULT
-// ============================================================
 
 bool loadVaultWithPassword(const char* pw, size_t pwLen,
                            uint8_t* outSalt,
@@ -769,6 +810,7 @@ void lockVault() {
   memset(editorBuffer, 0, sizeof(editorBuffer));
   editorLen = 0;
   editorCursor = 0;
+  currentTotp[0] = 0;
   selectedRecord = 0;
   menuIndex = 0;
   currentScreen = SCREEN_LOCKED;
@@ -837,6 +879,63 @@ void newGeneratedPassword() {
   bool up, lo, nu, sy;
   applyGeneratorMode(up, lo, nu, sy);
   generatePassword(generatedPassword, generatorLength, up, lo, nu, sy);
+}
+
+// ============================================================
+// TOTP (RFC 6238)
+// ============================================================
+
+int base32Decode(const char* in, uint8_t* out, int maxOut) {
+  int bits = 0, val = 0, n = 0;
+  for (const char* p = in; *p; p++) {
+    char c = toupper(*p);
+    if (c == ' ' || c == '-') continue;
+    int d;
+    if (c >= 'A' && c <= 'Z') d = c - 'A';
+    else if (c >= '2' && c <= '7') d = c - '2' + 26;
+    else continue;
+    val = (val << 5) | d;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      if (n < maxOut) out[n++] = (val >> bits) & 0xFF;
+    }
+  }
+  return n;
+}
+
+bool totpGenerate(const char* secretB32, uint32_t t, char* out6) {
+  uint8_t key[64];
+  int keyLen = base32Decode(secretB32, key, sizeof(key));
+  if (keyLen == 0) return false;
+
+  uint8_t msg[8];
+  for (int i = 7; i >= 0; i--) { msg[i] = t & 0xFF; t >>= 8; }
+
+  uint8_t hash[20];
+  if (!hmacSha1(key, keyLen, msg, 8, hash)) {
+    memset(key, 0, sizeof(key));
+    return false;
+  }
+  memset(key, 0, sizeof(key));
+
+  int off = hash[19] & 0x0F;
+  uint32_t bin =
+    ((uint32_t)(hash[off] & 0x7F) << 24) |
+    ((uint32_t)hash[off + 1] << 16) |
+    ((uint32_t)hash[off + 2] << 8)  |
+    (uint32_t)hash[off + 3];
+  uint32_t code = bin % 1000000;
+  snprintf(out6, 8, "%06lu", (unsigned long)code);
+  return true;
+}
+
+void totpRefresh(const char* secret) {
+  if (!secret || !*secret) { currentTotp[0] = 0; return; }
+  time_t now = time(nullptr);
+  if (now < 1600000000) { currentTotp[0] = 0; return; }  // NTP not synced
+  uint32_t t = (uint32_t)(now / 30);
+  if (!totpGenerate(secret, t, currentTotp)) currentTotp[0] = 0;
 }
 
 // ============================================================
@@ -911,81 +1010,160 @@ bool checkCSRF() {
 }
 
 // ============================================================
-// WEB UI
+// WEB UI  —  Apple-style, no emoji
 // ============================================================
 
 String htmlHeader(const String& title) {
   String h;
   h.reserve(4096);
-  h += F("<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'>"
-         "<meta name='viewport' content='width=device-width,initial-scale=1'>");
+  h += F("<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
+         "<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>"
+         "<meta name='color-scheme' content='light dark'>");
   h += F("<title>");
   h += htmlEscape(title);
-  h += F(" · VAULT</title>");
+  h += F("</title>");
   h += F(R"HTML(
 <style>
-:root{--bg:#080a0d;--panel:#11151a;--panel2:#171c22;--border:#252b33;--text:#edf2f5;--muted:#89939f;--accent:#57e6a5;--danger:#ff6464;--radius:16px}
-*{box-sizing:border-box}
-body{margin:0 auto;max-width:700px;padding:18px 15px 50px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.45}
-h1{font-size:1.35rem;margin:3px 0 10px}
-h2{font-size:1rem;color:var(--muted)}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin:12px 0}
-.top{display:flex;align-items:center;justify-content:space-between;gap:10px}
-input,textarea,select{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:11px;padding:12px;margin:6px 0;font:inherit}
-input.mono,textarea.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
-button,.btn{display:inline-block;padding:10px 13px;border-radius:11px;border:1px solid var(--border);background:var(--panel2);color:var(--text);text-decoration:none;cursor:pointer}
-button.primary,.btn.primary{background:var(--accent);border-color:var(--accent);color:#04120b;font-weight:700}
-button.danger,.btn.danger{color:var(--danger)}
-.actions{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
-.entry{padding:14px;border:1px solid var(--border);border-radius:13px;margin:9px 0;background:var(--panel)}
-.name{font-weight:700}
-.user{color:var(--muted);font-size:.9rem}
-.small{font-size:.85rem}
+:root{
+  --bg:#f5f5f7; --card:#ffffff; --text:#1d1d1f; --muted:#6e6e73;
+  --line:#d2d2d7; --accent:#0071e3; --accent-text:#ffffff;
+  --danger:#d70015; --input:#ffffff; --radius:14px;
+  --shadow:0 1px 2px rgba(0,0,0,.04),0 8px 24px rgba(0,0,0,.06);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#000000; --card:#1c1c1e; --text:#f5f5f7; --muted:#98989d;
+    --line:#38383a; --accent:#0a84ff; --accent-text:#ffffff;
+    --danger:#ff453a; --input:#2c2c2e;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.5);
+  }
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Inter,sans-serif;
+  font-size:16px; line-height:1.47;
+  -webkit-font-smoothing:antialiased;
+  padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+}
+.wrap{max-width:640px;margin:0 auto;padding:24px 20px 64px}
+header.top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:8px 0 24px}
+header.top h1{font-size:24px;font-weight:600;letter-spacing:-.02em;margin:0}
+.card{
+  background:var(--card); border:1px solid var(--line);
+  border-radius:var(--radius); padding:20px; margin:14px 0;
+  box-shadow:var(--shadow);
+}
+.card h2{font-size:17px;font-weight:600;letter-spacing:-.01em;margin:0 0 12px}
+.card p{margin:6px 0}
+label.field{display:block;font-size:13px;color:var(--muted);margin:14px 0 6px;font-weight:500}
+input,textarea,select{
+  width:100%; background:var(--input); color:var(--text);
+  border:1px solid var(--line); border-radius:10px;
+  padding:12px 14px; font:inherit; font-size:16px;
+  transition:border-color .15s, box-shadow .15s;
+}
+input:focus,textarea:focus{outline:none;border-color:var(--accent);
+  box-shadow:0 0 0 4px color-mix(in srgb, var(--accent) 15%, transparent)}
+input.mono,textarea.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;letter-spacing:.02em}
+textarea{resize:vertical;min-height:88px}
+.btn,button{
+  display:inline-flex;align-items:center;justify-content:center;
+  gap:6px;padding:10px 18px;border-radius:10px;
+  border:1px solid var(--line); background:var(--card); color:var(--text);
+  font:inherit; font-size:15px; font-weight:500; cursor:pointer;
+  text-decoration:none; transition:transform .1s, background .15s, opacity .15s;
+}
+.btn:active,button:active{transform:scale(.98)}
+.btn.primary,button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-text)}
+.btn.danger,button.danger{color:var(--danger);border-color:var(--line)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--accent);padding:8px 10px}
+.btn.block{display:flex;width:100%}
+.actions{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 0}
+.actions.compact{margin:10px 0 0}
+.row{display:flex;align-items:center;gap:10px;justify-content:space-between;margin:8px 0}
 .muted{color:var(--muted)}
-.error{color:var(--danger)}
-.stat{display:flex;justify-content:space-between;margin:4px 0}
-.bar{height:8px;background:var(--panel2);border-radius:8px;overflow:hidden}
-.fill{height:100%;background:var(--accent)}
-.chk{display:inline-flex;gap:5px;align-items:center;margin:5px 12px 5px 0;color:var(--muted)}
-.warn{border-color:#725f24}
+.small{font-size:13px}
+.tiny{font-size:12px;letter-spacing:.01em}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;background:color-mix(in srgb,var(--accent) 15%,transparent);
+  color:var(--accent);font-size:12px;font-weight:600}
+.entry{
+  background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:16px;margin:10px 0;box-shadow:var(--shadow);
+  display:flex;flex-direction:column;gap:10px;
+}
+.entry .name{font-weight:600;font-size:16px;letter-spacing:-.01em}
+.entry .user{color:var(--muted);font-size:14px}
+.entry .row-actions{display:flex;gap:8px;flex-wrap:wrap}
+.error{color:var(--danger);font-size:14px;margin:8px 0}
+.notice{
+  background:color-mix(in srgb,var(--accent) 8%, transparent);
+  border:1px solid color-mix(in srgb,var(--accent) 25%, var(--line));
+  border-radius:var(--radius); padding:14px 16px; margin:14px 0;
+}
+code.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+  background:var(--input);padding:2px 6px;border-radius:6px;font-size:13px}
+.stat{display:flex;justify-content:space-between;align-items:center;margin:6px 0;font-size:14px}
+.stat b{font-weight:600}
+.bar{height:6px;background:var(--input);border-radius:6px;overflow:hidden;margin-top:8px}
+.fill{height:100%;background:var(--accent);transition:width .3s}
+.totp{
+  font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+  font-size:32px;font-weight:600;letter-spacing:.1em;
+  text-align:center;padding:14px;border-radius:12px;
+  background:var(--input);border:1px solid var(--line);
+}
+.divider{height:1px;background:var(--line);margin:16px 0;border:0}
 </style>
 )HTML");
-  h += F("</head><body>");
+  h += F("</head><body><div class='wrap'>");
   return h;
 }
 
 String htmlFooter() {
   return F(R"HTML(
+</div>
 <script>
-function copyField(id){const e=document.getElementById(id);if(!e)return;
- navigator.clipboard?navigator.clipboard.writeText(e.value):(e.select(),document.execCommand('copy'));}
-function toggleField(id,b){const e=document.getElementById(id);
- if(e.type==='password'){e.type='text';b.textContent='Скрыть';}
- else{e.type='password';b.textContent='Показать';}}
+function copyField(id){
+  const e=document.getElementById(id);
+  if(!e)return;
+  const v=e.value!==undefined?e.value:e.textContent;
+  navigator.clipboard?navigator.clipboard.writeText(v):(e.select&&e.select(),document.execCommand('copy'));
+}
+function toggleField(id,b){
+  const e=document.getElementById(id);
+  if(e.type==='password'){e.type='text';b.textContent='Hide';}
+  else{e.type='password';b.textContent='Show';}
+}
 </script>
 </body></html>
 )HTML");
 }
 
 // ============================================================
-// WEB HOME
+// WEB: HOME
 // ============================================================
 
 void webHome() {
   if (!LittleFS.exists(VAULT_FILE)) { redirectTo("/setup"); return; }
 
   if (!checkSession()) {
-    String h = htmlHeader("Unlock");
-    h += F("<div class='card'><h1>🔐 VAULT</h1><p class='muted'>Введите мастер-пароль.</p>");
+    String h = htmlHeader("Vault");
+    h += F("<header class='top'><h1>Vault</h1></header>");
+    h += F("<div class='card'><h2>Unlock</h2>"
+           "<p class='muted small'>Enter your master password to continue.</p>");
     if (server.hasArg("err")) {
+      h += F("<p class='error'>Incorrect password.");
       String wait = server.arg("wait");
-      h += F("<p class='error'>Неверный пароль.");
-      if (wait.length()) { h += F(" Повтор через "); h += htmlEscape(wait); h += F(" с."); }
+      if (wait.length()) { h += F(" Try again in "); h += htmlEscape(wait); h += F(" s."); }
       h += F("</p>");
     }
     h += F("<form method='POST' action='/unlock'>"
-           "<input type='password' name='password' placeholder='Мастер-пароль' autocomplete='current-password' autofocus>"
-           "<button class='primary' type='submit'>Разблокировать</button></form></div>");
+           "<label class='field'>Master password</label>"
+           "<input type='password' name='password' autocomplete='current-password' autofocus>"
+           "<div class='actions'><button class='primary block' type='submit'>Unlock</button></div>"
+           "</form></div>");
     h += htmlFooter();
     server.send(200, "text/html", h);
     return;
@@ -995,78 +1173,93 @@ void webHome() {
   size_t total = LittleFS.totalBytes();
   int pct = total ? (used * 100UL) / total : 0;
 
-  String h = htmlHeader("VAULT");
+  String h = htmlHeader("Vault");
   h.reserve(8192);
-  h += F("<div class='top'><h1>🔐 VAULT</h1>"
-         "<form method='POST' action='/lock'>"
+
+  h += F("<header class='top'><h1>Vault</h1>"
+         "<form method='POST' action='/lock' style='margin:0'>"
          "<input type='hidden' name='csrf' value='");
   h += webToken;
-  h += F("'><button class='danger'>Заблокировать</button></form></div>");
+  h += F("'><button class='btn danger'>Lock</button></form></header>");
 
-  h += F("<div class='card'><div class='stat'><span>Записей</span><b>");
+  h += F("<div class='card'><div class='stat'><span class='muted'>Records</span><b>");
   h += String(vault.count);
   h += F(" / ");
   h += String(MAX_RECORDS);
-  h += F("</b></div><div class='stat'><span>Flash</span><b>");
+  h += F("</b></div><div class='stat'><span class='muted'>Storage</span><b>");
   h += String(used / 1024);
   h += F(" / ");
   h += String(total / 1024);
-  h += F(" КБ</b></div><div class='bar'><div class='fill' style='width:");
+  h += F(" KB</b></div><div class='bar'><div class='fill' style='width:");
   h += String(pct);
   h += F("%'></div></div></div>");
 
   h += F("<div class='actions'>"
-         "<a class='btn primary' href='/add'>+ Добавить</a>"
-         "<a class='btn' href='/search'>Поиск</a>"
-         "<a class='btn' href='/generator'>Генератор</a>"
-         "<a class='btn' href='/settings'>Настройки</a></div>");
+         "<a class='btn primary' href='/add'>Add record</a>"
+         "<a class='btn' href='/search'>Search</a>"
+         "<a class='btn' href='/generator'>Generator</a>"
+         "<a class='btn' href='/settings'>Settings</a></div>");
+
+  if (vault.count == 0) {
+    h += F("<div class='card'><p class='muted'>No records yet.</p></div>");
+  }
 
   for (int i = 0; i < vault.count; i++) {
     VaultRecord &r = vault.records[i];
-    h += F("<div class='entry'><div class='name'>");
+    h += F("<div class='entry'><div><div class='name'>");
     h += htmlEscape(r.name);
-    h += F("</div><div class='user'>");
-    h += htmlEscape(r.username);
-    h += F("</div><div class='actions'><a class='btn small' href='/view?id=");
+    h += F("</div>");
+    if (strlen(r.username)) {
+      h += F("<div class='user'>");
+      h += htmlEscape(r.username);
+      h += F("</div>");
+    }
+    h += F("</div><div class='row-actions'>"
+           "<a class='btn' href='/view?id=");
     h += String(i);
-    h += F("'>Открыть</a><a class='btn small' href='/edit?id=");
+    h += F("'>Open</a><a class='btn' href='/edit?id=");
     h += String(i);
-    h += F("'>Изменить</a>"
-           "<form method='POST' action='/delete' style='display:inline' "
-           "onsubmit=\"return confirm('Удалить запись?')\">"
+    h += F("'>Edit</a>"
+           "<form method='POST' action='/delete' style='margin:0' "
+           "onsubmit=\"return confirm('Delete this record?')\">"
            "<input type='hidden' name='id' value='");
     h += String(i);
     h += F("'><input type='hidden' name='csrf' value='");
     h += webToken;
-    h += F("'><button class='danger small'>Удалить</button></form></div></div>");
+    h += F("'><button class='btn danger'>Delete</button></form></div></div>");
   }
-  if (vault.count == 0) h += F("<div class='card muted'>Vault пока пуст.</div>");
+
   h += htmlFooter();
   server.send(200, "text/html", h);
 }
 
 // ============================================================
-// SETUP WEB
+// WEB: SETUP
 // ============================================================
 
 void webSetup() {
   if (LittleFS.exists(VAULT_FILE)) { redirectTo("/"); return; }
 
-  String h = htmlHeader("Первичная настройка");
-  h += F("<div class='card'><h1>Первичная настройка</h1>"
-         "<p class='muted'>Мастер-пароль защищает весь vault. Минимум 8 символов.</p>"
-         "<p class='warn card'>ВАЖНО: забытый мастер-пароль невосстановим.</p>");
+  String h = htmlHeader("Setup");
+  h += F("<header class='top'><h1>Setup</h1></header>");
+  h += F("<div class='card'><h2>Create master password</h2>"
+         "<p class='muted small'>Minimum 8 characters. This password encrypts your vault and is never stored.</p>"
+         "<div class='notice small'>The master password cannot be recovered. Write it down somewhere safe.</div>");
   if (server.hasArg("err"))
-    h += F("<p class='error'>Пароли не совпадают или имеют недопустимую длину.</p>");
+    h += F("<p class='error'>Passwords do not match or are too short.</p>");
   h += F("<form method='POST' action='/setup'>"
-         "<input type='password' name='password' placeholder='Мастер-пароль' required>"
-         "<input type='password' name='confirm' placeholder='Повторить' required>"
-         "<button class='primary'>Создать vault</button></form></div>");
-  h += F("<div class='card'><h2>Wi-Fi</h2><div class='muted'>SSID</div><b>");
+         "<label class='field'>Master password</label>"
+         "<input type='password' name='password' required>"
+         "<label class='field'>Confirm password</label>"
+         "<input type='password' name='confirm' required>"
+         "<div class='actions'><button class='primary block'>Create vault</button></div>"
+         "</form></div>");
+  h += F("<div class='card'><h2>Wi-Fi access</h2>"
+         "<div class='row'><span class='muted small'>SSID</span><b>");
   h += htmlEscape(apSsid);
-  h += F("</b><div class='muted'>Пароль</div><b>");
+  h += F("</b></div><div class='row'><span class='muted small'>Password</span><b>");
   h += htmlEscape(config.apPassword);
-  h += F("</b><p class='muted small'>Подключитесь к этой сети и откройте 192.168.4.1.</p></div>");
+  h += F("</b></div><p class='muted tiny'>Connect to this network and open 192.168.4.1.</p></div>");
   h += htmlFooter();
   server.send(200, "text/html", h);
 }
@@ -1087,7 +1280,7 @@ void webSetupPost() {
 }
 
 // ============================================================
-// UNLOCK WEB  —  FIX: lockVault not called here
+// WEB: UNLOCK / LOCK
 // ============================================================
 
 void webUnlockPost() {
@@ -1105,23 +1298,39 @@ void webUnlockPost() {
   redirectTo(q);
 }
 
+void webLock() {
+  if (!checkSession()) { redirectTo("/"); return; }
+  if (!checkCSRF()) return;
+
+  clearSessionCookie();
+  redirectTo("/");
+  delay(50);
+  lockVault();
+}
+
 // ============================================================
-// ADD
+// WEB: ADD / EDIT / VIEW / DELETE
 // ============================================================
 
 void webAdd() {
   if (!requireAuth()) return;
-  String h = htmlHeader("Добавить");
-  h += F("<div class='card'><h1>+ Новая запись</h1>"
-         "<form method='POST' action='/add'>"
-         "<input name='name' placeholder='Сервис' required>"
-         "<input name='username' placeholder='Логин / email'>"
-         "<input name='password' placeholder='Пароль'>"
-         "<textarea name='note' rows='4' placeholder='Заметка'></textarea>"
+  String h = htmlHeader("Add record");
+  h += F("<header class='top'><h1>Add record</h1></header>");
+  h += F("<div class='card'><form method='POST' action='/add'>"
+         "<label class='field'>Service</label>"
+         "<input name='name' required>"
+         "<label class='field'>Username</label>"
+         "<input name='username'>"
+         "<label class='field'>Password</label>"
+         "<input name='password' class='mono'>"
+         "<label class='field'>TOTP secret (Base32, optional)</label>"
+         "<input name='totp' class='mono' placeholder='JBSWY3DPEHPK3PXP'>"
+         "<label class='field'>Note</label>"
+         "<textarea name='note' rows='3'></textarea>"
          "<input type='hidden' name='csrf' value='");
   h += webToken;
-  h += F("'><button class='primary'>Сохранить</button></form></div>"
-         "<a class='btn' href='/'>← Назад</a>");
+  h += F("'><div class='actions'><button class='primary'>Save</button>"
+         "<a class='btn' href='/'>Cancel</a></div></form></div>");
   h += htmlFooter();
   server.send(200, "text/html", h);
 }
@@ -1141,6 +1350,7 @@ void webAddPost() {
   strlcpy(r.username, server.arg("username").c_str(), MAX_USER);
   strlcpy(r.password, server.arg("password").c_str(), MAX_PASS);
   strlcpy(r.note, server.arg("note").c_str(), MAX_NOTE);
+  strlcpy(r.totp, server.arg("totp").c_str(), MAX_TOTP);
   vault.count++;
 
   if (!saveCurrentVault()) {
@@ -1152,67 +1362,102 @@ void webAddPost() {
   redirectTo("/");
 }
 
-// ============================================================
-// VIEW
-// ============================================================
-
 void webView() {
   if (!requireAuth()) return;
   int id = server.arg("id").toInt();
   if (id < 0 || id >= vault.count) { server.send(404, "text/plain", "Not found"); return; }
   VaultRecord &r = vault.records[id];
+
   String h = htmlHeader(r.name);
-  h += F("<div class='card'><h1>");
+  h += F("<header class='top'><h1>");
   h += htmlEscape(r.name);
-  h += F("</h1><div class='muted'>Логин</div><input value='");
+  h += F("</h1></header>");
+
+  h += F("<div class='card'>");
+  h += F("<label class='field'>Username</label>"
+         "<input value='");
   h += htmlEscape(r.username);
-  h += F("' readonly><div class='muted'>Пароль</div>"
+  h += F("' readonly>");
+
+  h += F("<label class='field'>Password</label>"
          "<input class='mono' type='password' id='pass' value='");
   h += htmlEscape(r.password);
-  h += F("' readonly><div class='actions'>"
-         "<button onclick=\"toggleField('pass',this)\">Показать</button>"
-         "<button onclick=\"copyField('pass')\">Копировать</button>"
-         "<a class='btn' href='/edit?id=");
-  h += String(id);
-  h += F("'>Изменить</a></div>");
+  h += F("' readonly>"
+         "<div class='actions compact'>"
+         "<button onclick=\"toggleField('pass',this)\">Show</button>"
+         "<button onclick=\"copyField('pass')\">Copy</button></div>");
+
   if (strlen(r.note)) {
-    h += F("<div class='muted'>Заметка</div><textarea readonly rows='4'>");
+    h += F("<label class='field'>Note</label>"
+           "<textarea readonly rows='3'>");
     h += htmlEscape(r.note);
     h += F("</textarea>");
   }
-  h += F("</div><a class='btn' href='/'>← Назад</a>");
+
+  h += F("</div>");
+
+  if (strlen(r.totp)) {
+    h += F("<div class='card'><h2>Two-factor code</h2>"
+           "<div class='totp' id='totp'>&mdash;</div>"
+           "<p class='muted tiny' style='text-align:center;margin-top:10px'>"
+           "Refreshes every 30 seconds.</p>"
+           "<div class='actions compact' style='justify-content:center'>"
+           "<button onclick=\"copyField('totp')\">Copy code</button></div>"
+           "<script>"
+           "(function(){"
+           "async function tick(){"
+           "try{const r=await fetch('/totp?id=");
+    h += String(id);
+    h += F("',{cache:'no-store'});const j=await r.json();"
+           "document.getElementById('totp').textContent=j.code||'------';"
+           "}catch(e){}"
+           "}"
+           "tick();setInterval(tick,5000);"
+           "})();"
+           "</script></div>");
+  }
+
+  h += F("<div class='actions'>"
+         "<a class='btn primary' href='/edit?id=");
+  h += String(id);
+  h += F("'>Edit</a><a class='btn' href='/'>Back</a></div>");
   h += htmlFooter();
   server.send(200, "text/html", h);
 }
-
-// ============================================================
-// EDIT
-// ============================================================
 
 void webEdit() {
   if (!requireAuth()) return;
   int id = server.arg("id").toInt();
   if (id < 0 || id >= vault.count) { server.send(404, "text/plain", "Not found"); return; }
   VaultRecord &r = vault.records[id];
-  String h = htmlHeader("Изменить");
-  h += F("<div class='card'><h1>Изменить запись</h1>"
-         "<form method='POST' action='/edit'>"
+
+  String h = htmlHeader("Edit");
+  h += F("<header class='top'><h1>Edit record</h1></header>");
+  h += F("<div class='card'><form method='POST' action='/edit'>"
          "<input type='hidden' name='id' value='");
   h += String(id);
   h += F("'><input type='hidden' name='csrf' value='");
   h += webToken;
-  h += F("'><input name='name' value='");
+  h += F("'><label class='field'>Service</label>"
+         "<input name='name' value='");
   h += htmlEscape(r.name);
-  h += F("' required><input name='username' value='");
+  h += F("' required><label class='field'>Username</label>"
+         "<input name='username' value='");
   h += htmlEscape(r.username);
-  h += F("'><input name='password' value='");
+  h += F("'><label class='field'>Password</label>"
+         "<input name='password' class='mono' value='");
   h += htmlEscape(r.password);
-  h += F("'><textarea name='note' rows='4'>");
+  h += F("'><label class='field'>TOTP secret (Base32, optional)</label>"
+         "<input name='totp' class='mono' value='");
+  h += htmlEscape(r.totp);
+  h += F("'><label class='field'>Note</label>"
+         "<textarea name='note' rows='3'>");
   h += htmlEscape(r.note);
-  h += F("</textarea><button class='primary'>Сохранить изменения</button></form></div>"
+  h += F("</textarea><div class='actions'>"
+         "<button class='primary'>Save</button>"
          "<a class='btn' href='/view?id=");
   h += String(id);
-  h += F("'>← Назад</a>");
+  h += F("'>Cancel</a></div></form></div>");
   h += htmlFooter();
   server.send(200, "text/html", h);
 }
@@ -1235,6 +1480,7 @@ void webEditPost() {
   strlcpy(r.username, server.arg("username").c_str(), MAX_USER);
   strlcpy(r.password, server.arg("password").c_str(), MAX_PASS);
   strlcpy(r.note, server.arg("note").c_str(), MAX_NOTE);
+  strlcpy(r.totp, server.arg("totp").c_str(), MAX_TOTP);
 
   if (!saveCurrentVault()) {
     memcpy(&r, &backup, sizeof(r));
@@ -1244,10 +1490,6 @@ void webEditPost() {
   memset(&backup, 0, sizeof(backup));
   redirectTo("/view?id=" + String(id));
 }
-
-// ============================================================
-// DELETE
-// ============================================================
 
 void webDeletePost() {
   if (!requireAuth()) return;
@@ -1272,7 +1514,32 @@ void webDeletePost() {
 }
 
 // ============================================================
-// SEARCH
+// WEB: TOTP JSON
+// ============================================================
+
+void webTotp() {
+  if (!requireAuth()) return;
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= vault.count) {
+    server.send(404, "application/json", "{}"); return;
+  }
+  VaultRecord &r = vault.records[id];
+  char code[8] = "------";
+  if (strlen(r.totp)) {
+    time_t now = time(nullptr);
+    if (now > 1600000000) {
+      uint32_t t = (uint32_t)(now / 30);
+      if (!totpGenerate(r.totp, t, code)) strlcpy(code, "------", sizeof(code));
+    }
+  }
+  String j = "{\"code\":\"";
+  j += code;
+  j += "\"}";
+  server.send(200, "application/json", j);
+}
+
+// ============================================================
+// WEB: SEARCH / GENERATOR / SETTINGS / CHANGE-MASTER
 // ============================================================
 
 void webSearch() {
@@ -1280,12 +1547,14 @@ void webSearch() {
   String q = server.arg("q");
   q.toLowerCase();
 
-  String h = htmlHeader("Поиск");
-  h += F("<div class='card'><h1>Поиск</h1><form method='GET'>"
+  String h = htmlHeader("Search");
+  h += F("<header class='top'><h1>Search</h1></header>");
+  h += F("<div class='card'><form method='GET'>"
          "<input name='q' value='");
   h += htmlEscape(server.arg("q"));
-  h += F("' placeholder='Сервис или логин' autofocus>"
-         "<button class='primary'>Искать</button></form></div>");
+  h += F("' placeholder='Service or username' autofocus>"
+         "<div class='actions'><button class='primary'>Search</button></div>"
+         "</form></div>");
 
   if (q.length()) {
     int found = 0;
@@ -1299,68 +1568,112 @@ void webSearch() {
         h += htmlEscape(vault.records[i].name);
         h += F("</div><div class='user'>");
         h += htmlEscape(vault.records[i].username);
-        h += F("</div><div class='actions'><a class='btn' href='/view?id=");
+        h += F("</div><div class='row-actions'><a class='btn' href='/view?id=");
         h += String(i);
-        h += F("'>Открыть</a></div></div>");
+        h += F("'>Open</a></div></div>");
         found++;
       }
     }
-    if (!found) h += F("<div class='card muted'>Ничего не найдено.</div>");
+    if (!found) h += F("<div class='card'><p class='muted'>No matches.</p></div>");
   }
-  h += F("<a class='btn' href='/'>← Назад</a>");
+  h += F("<div class='actions'><a class='btn' href='/'>Back</a></div>");
   h += htmlFooter();
   server.send(200, "text/html", h);
 }
 
-// ============================================================
-// GENERATOR WEB
-// ============================================================
-
 void webGenerator() {
   if (!requireAuth()) return;
-
   int len = server.hasArg("len") ? server.arg("len").toInt() : 24;
   if (len < 8) len = 8;
   if (len > MAX_PASS - 1) len = MAX_PASS - 1;
 
-  bool up = true, lo = true, nu = true, sy = true;
   char p[MAX_PASS + 1];
-  generatePassword(p, len, up, lo, nu, sy);
+  generatePassword(p, len, true, true, true, true);
 
-  String h = htmlHeader("Генератор");
-  h += F("<div class='card'><h1>🎲 Генератор</h1>"
-         "<input class='mono' id='generated' value='");
+  String h = htmlHeader("Generator");
+  h += F("<header class='top'><h1>Generator</h1></header>");
+  h += F("<div class='card'><input class='mono' id='generated' value='");
   h += p;
-  h += F("' readonly><div class='actions'>"
-         "<button onclick=\"copyField('generated')\">Копировать</button></div></div>");
+  h += F("' readonly><div class='actions compact'>"
+         "<button onclick=\"copyField('generated')\">Copy</button></div></div>");
 
-  h += F("<form class='card' method='GET'><div>Длина: ");
+  h += F("<div class='card'><form method='GET'>"
+         "<label class='field'>Length: ");
   h += String(len);
-  h += F("</div><input type='range' name='len' min='8' max='95' value='");
+  h += F("</label>"
+         "<input type='range' name='len' min='8' max='95' value='");
   h += String(len);
-  h += F("'><label class='chk'><input type='checkbox' name='up' checked>A-Z</label>"
-         "<label class='chk'><input type='checkbox' name='lo' checked>a-z</label>"
-         "<label class='chk'><input type='checkbox' name='nu' checked>0-9</label>"
-         "<label class='chk'><input type='checkbox' name='sy' checked>!@#</label>"
-         "<button class='primary'>Сгенерировать</button></form>");
+  h += F("'><div class='actions'><button class='primary'>Generate</button>"
+         "<a class='btn' href='/generator'>Reset</a></div></form></div>");
 
-  h += F("<div class='card'><h2>Сразу сохранить</h2>"
+  h += F("<div class='card'><h2>Save this password</h2>"
          "<form method='POST' action='/add'>"
-         "<input name='name' placeholder='Сервис' required>"
-         "<input name='username' placeholder='Логин / email'>"
+         "<label class='field'>Service</label>"
+         "<input name='name' required>"
+         "<label class='field'>Username</label>"
+         "<input name='username'>"
          "<input type='hidden' name='password' value='");
   h += p;
   h += F("'><input type='hidden' name='csrf' value='");
   h += webToken;
-  h += F("'><button class='primary'>Сохранить пароль</button></form></div>"
-         "<a class='btn' href='/'>← Назад</a>");
+  h += F("'><div class='actions'><button class='primary'>Save</button>"
+         "<a class='btn' href='/'>Back</a></div></form></div>");
   h += htmlFooter();
   server.send(200, "text/html", h);
 }
 
-// ============================================================
-// CHANGE MASTER
-// ============================================================
+void webSettings() {
+  if (!requireAuth()) return;
+  size_t used = LittleFS.usedBytes();
+  size_t total = LittleFS.totalBytes();
+
+  String h = htmlHeader("Settings");
+  h += F("<header class='top'><h1>Settings</h1></header>");
+
+  h += F("<div class='card'><h2>Device</h2>"
+         "<div class='stat'><span class='muted'>Auto-lock</span><b>");
+  h += String(config.autoLockSeconds);
+  h += F(" s</b></div><div class='stat'><span class='muted'>Storage</span><b>");
+  h += String(used / 1024);
+  h += F(" / ");
+  h += String(total / 1024);
+  h += F(" KB</b></div>"
+         "<div class='stat'><span class='muted'>Records</span><b>");
+  h += String(vault.count);
+  h += F(" / ");
+  h += String(MAX_RECORDS);
+  h += F("</b></div></div>");
+
+  h += F("<div class='card'><h2>Wi-Fi access</h2>"
+         "<div class='stat'><span class='muted'>SSID</span><b>");
+  h += htmlEscape(apSsid);
+  h += F("</b></div><div class='stat'><span class='muted'>Password</span><b>");
+  h += htmlEscape(config.apPassword);
+  h += F("</b></div></div>");
+
+  h += F("<div class='card'><h2>Security</h2>"
+         "<a class='btn' href='/change-master'>Change master password</a></div>");
+
+  h += F("<div class='card'><h2>Backup</h2>"
+         "<p class='muted small'>Download the encrypted vault file. It contains its own salt, IV and MAC.</p>"
+         "<a class='btn primary' href='/backup'>Download backup</a></div>");
+
+  h += F("<div class='card'><h2>Restore</h2>"
+         "<p class='muted small'>Restoring replaces the current vault. The backup's master password becomes the new device password.</p>"
+         "<form method='POST' action='/restore' enctype='multipart/form-data'>"
+         "<label class='field'>Backup file</label>"
+         "<input type='file' name='backup' required>"
+         "<label class='field'>Backup master password</label>"
+         "<input type='password' name='backupPassword' required>"
+         "<input type='hidden' name='csrf' value='");
+  h += webToken;
+  h += F("'><div class='actions'><button class='danger'>Restore</button></div>"
+         "</form></div>");
+
+  h += F("<div class='actions'><a class='btn' href='/'>Back</a></div>");
+  h += htmlFooter();
+  server.send(200, "text/html", h);
+}
 
 bool changeMasterPassword(const char* pw, size_t pwLen) {
   if (pwLen < 8 || pwLen > 64) return false;
@@ -1404,18 +1717,20 @@ bool changeMasterPassword(const char* pw, size_t pwLen) {
 
 void webChangeMaster() {
   if (!requireAuth()) return;
-  String h = htmlHeader("Мастер-пароль");
-  h += F("<div class='card'><h1>Смена мастер-пароля</h1>"
-         "<p class='muted'>Vault будет полностью перешифрован новым ключом и новой солью.</p>");
+  String h = htmlHeader("Change master password");
+  h += F("<header class='top'><h1>Change master password</h1></header>");
+  h += F("<div class='card'><p class='muted small'>The vault will be re-encrypted with a new key and a new salt.</p>");
   if (server.hasArg("err"))
-    h += F("<p class='error'>Пароли не совпадают или слишком короткие.</p>");
+    h += F("<p class='error'>Passwords do not match or are too short.</p>");
   h += F("<form method='POST' action='/change-master'>"
-         "<input type='password' name='password' placeholder='Новый мастер-пароль' required>"
-         "<input type='password' name='confirm' placeholder='Повторите пароль' required>"
+         "<label class='field'>New master password</label>"
+         "<input type='password' name='password' required>"
+         "<label class='field'>Confirm password</label>"
+         "<input type='password' name='confirm' required>"
          "<input type='hidden' name='csrf' value='");
   h += webToken;
-  h += F("'><button class='primary'>Изменить</button></form></div>"
-         "<a class='btn' href='/settings'>← Назад</a>");
+  h += F("'><div class='actions'><button class='primary'>Change</button>"
+         "<a class='btn' href='/settings'>Cancel</a></div></form></div>");
   h += htmlFooter();
   server.send(200, "text/html", h);
 }
@@ -1437,42 +1752,7 @@ void webChangeMasterPost() {
 }
 
 // ============================================================
-// SETTINGS
-// ============================================================
-
-void webSettings() {
-  if (!requireAuth()) return;
-  size_t used = LittleFS.usedBytes();
-  size_t total = LittleFS.totalBytes();
-
-  String h = htmlHeader("Настройки");
-  h += F("<div class='card'><h1>Настройки</h1><div class='stat'><span>Автоблокировка</span><b>");
-  h += String(config.autoLockSeconds);
-  h += F(" сек.</b></div><div class='stat'><span>Flash</span><b>");
-  h += String(used / 1024);
-  h += F(" / ");
-  h += String(total / 1024);
-  h += F(" КБ</b></div></div>"
-         "<div class='card'><h2>Безопасность</h2>"
-         "<a class='btn' href='/change-master'>Сменить мастер-пароль</a></div>"
-         "<div class='card'><h2>Backup</h2>"
-         "<p class='muted'>Скачать зашифрованный vault.bin.</p>"
-         "<a class='btn primary' href='/backup'>Скачать backup</a></div>"
-         "<div class='card'><h2>Restore</h2>"
-         "<p class='muted'>Restore заменит текущий vault.</p>"
-         "<form method='POST' action='/restore' enctype='multipart/form-data'>"
-         "<input type='file' name='backup' required>"
-         "<input type='password' name='backupPassword' placeholder='Мастер-пароль backup' required>"
-         "<input type='hidden' name='csrf' value='");
-  h += webToken;
-  h += F("'><button class='danger'>Восстановить</button></form></div>"
-         "<a class='btn' href='/'>← Назад</a>");
-  h += htmlFooter();
-  server.send(200, "text/html", h);
-}
-
-// ============================================================
-// BACKUP / RESTORE
+// WEB: BACKUP / RESTORE
 // ============================================================
 
 void webBackup() {
@@ -1608,23 +1888,6 @@ void webRestorePost() {
 }
 
 // ============================================================
-// LOCK WEB  —  FIX: send response BEFORE stopping state
-// ============================================================
-
-void webLock() {
-  if (!checkSession()) { redirectTo("/"); return; }
-  if (!checkCSRF()) return;
-
-  // Send redirect first, then lock.
-  clearSessionCookie();
-  redirectTo("/");
-
-  // Small delay ensures WebServer flushes the response.
-  delay(50);
-  lockVault();
-}
-
-// ============================================================
 // WEB SERVER
 // ============================================================
 
@@ -1642,6 +1905,7 @@ void startWebServer() {
   server.on("/edit", HTTP_GET, webEdit);
   server.on("/edit", HTTP_POST, webEditPost);
   server.on("/delete", HTTP_POST, webDeletePost);
+  server.on("/totp", HTTP_GET, webTotp);
   server.on("/search", HTTP_GET, webSearch);
   server.on("/generator", HTTP_GET, webGenerator);
   server.on("/settings", HTTP_GET, webSettings);
@@ -1672,29 +1936,19 @@ void startWiFi() {
 }
 
 // ============================================================
-// OLED HELPERS
+// OLED DRAW HELPERS
 // ============================================================
 
-void header(const String& title) {
+void drawHeader(const char* title) {
   oled.setFont(u8g2_font_6x10_tf);
-  oled.drawStr(0, 9, title.c_str());
+  oled.drawStr(0, 9, title);
   oled.drawHLine(0, 12, 128);
-}
-
-void showBoot() {
-  oled.clearBuffer();
-  oled.setFont(u8g2_font_7x14B_tf);
-  oled.drawStr(29, 27, "VAULT");
-  oled.setFont(u8g2_font_6x10_tf);
-  oled.drawStr(35, 43, "OS 0.7");
-  oled.sendBuffer();
-  delay(900);
 }
 
 void drawMenu(const char* title, const char* items[],
               int count, int selected) {
   oled.clearBuffer();
-  header(title);
+  drawHeader(title);
   oled.setFont(u8g2_font_6x10_tf);
   int first = selected - 1;
   if (first < 0) first = 0;
@@ -1714,38 +1968,98 @@ void drawMenu(const char* title, const char* items[],
 }
 
 // ============================================================
-// LOCKED SCREEN
+// OLED: BOOT
+// ============================================================
+
+void showBoot() {
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_7x14B_tf);
+  oled.drawStr(38, 30, "VAULT");
+  oled.setFont(u8g2_font_5x7_tf);
+  oled.drawStr(48, 44, "OS 0.8");
+  oled.sendBuffer();
+  delay(800);
+}
+
+// ============================================================
+// OLED: LOCKED  (now informative)
 // ============================================================
 
 void showLocked() {
   oled.clearBuffer();
-  oled.setFont(u8g2_font_7x14B_tf);
-  oled.drawStr(30, 24, "VAULT");
   oled.setFont(u8g2_font_6x10_tf);
 
-  char buf[24];
+  // Title
+  oled.drawStr(0, 9, "VAULT LOCKED");
+  oled.drawHLine(0, 12, 128);
+
+  // Wi-Fi info
+  oled.setFont(u8g2_font_5x7_tf);
+  oled.drawStr(0, 22, "Wi-Fi:");
+  oled.drawStr(34, 22, apSsid.c_str());
+  oled.drawStr(0, 31, "Pass:");
+  oled.drawStr(34, 31, config.apPassword);
+  oled.drawStr(0, 40, "Web:");
+  oled.drawStr(34, 40, "192.168.4.1");
+
+  // Actions
+  oled.setFont(u8g2_font_6x10_tf);
   if (lockoutUntil > millis()) {
     unsigned long s = (lockoutUntil - millis() + 999) / 1000;
-    snprintf(buf, sizeof(buf), "WAIT %lus", s);
-    oled.drawStr(39, 43, buf);
+    char buf[20];
+    snprintf(buf, sizeof(buf), "Wait %lus", s);
+    oled.drawStr(38, 55, buf);
   } else {
-    oled.drawStr(36, 43, "R7 ENTER");
+    oled.drawStr(6, 55, "R7=enter  R5=info");
   }
-  oled.drawStr(18, 57, "R5/R6 UP/DOWN");
   oled.sendBuffer();
 }
 
 // ============================================================
-// EDITOR WITH CURSOR
+// OLED: INFO SCREEN
 // ============================================================
 
-void resetEditor(EditTarget target) {
-  memset(editorBuffer, 0, sizeof(editorBuffer));
-  editorLen = 0;
-  editorCursor = 0;
-  editorCharset = 0;
-  editorCharIndex = 0;
-  editorTarget = target;
+void showInfo() {
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_6x10_tf);
+  oled.drawStr(0, 9, "INFO");
+  oled.drawHLine(0, 12, 128);
+
+  oled.setFont(u8g2_font_5x7_tf);
+  oled.drawStr(0, 22, "SSID");
+  oled.drawStr(0, 31, apSsid.c_str());
+  oled.drawStr(0, 42, "AP PASS");
+  oled.drawStr(0, 51, config.apPassword);
+  oled.drawStr(0, 62, "http://192.168.4.1");
+  oled.sendBuffer();
+}
+
+// ============================================================
+// KEYBOARD
+// ============================================================
+
+// Returns current cell char, or 0 if action row
+char kbdCurrentChar() {
+  if (kbdRow < 3) {
+    const char* row = KBD_ROWS[kbdLayout][kbdRow];
+    int len = strlen(row);
+    if (kbdCol >= len) kbdCol = len - 1;
+    if (kbdCol < 0) kbdCol = 0;
+    return row[kbdCol];
+  }
+  return 0;
+}
+
+void kbdClampCursor() {
+  if (kbdRow < 3) {
+    int len = strlen(KBD_ROWS[kbdLayout][kbdRow]);
+    if (kbdCol >= len) kbdCol = len - 1;
+  } else {
+    if (kbdCol > 5) kbdCol = 5;
+  }
+  if (kbdCol < 0) kbdCol = 0;
+  if (kbdRow < 0) kbdRow = 0;
+  if (kbdRow > 3) kbdRow = 3;
 }
 
 void editorInsertChar(char c) {
@@ -1761,8 +2075,7 @@ void editorInsertChar(char c) {
 }
 
 void editorDeleteChar() {
-  if (editorLen == 0) return;
-  if (editorCursor <= 0) return;
+  if (editorLen == 0 || editorCursor <= 0) return;
   for (int i = editorCursor - 1; i < editorLen - 1; i++)
     editorBuffer[i] = editorBuffer[i + 1];
   editorLen--;
@@ -1770,65 +2083,120 @@ void editorDeleteChar() {
   editorBuffer[editorLen] = 0;
 }
 
-void editorDraw(const char* title, bool hide) {
-  oled.clearBuffer();
-  header(title);
-  oled.setFont(u8g2_font_6x10_tf);
+const char* editorTitle() {
+  switch (editorTarget) {
+    case EDIT_MASTER:         return "MASTER";
+    case EDIT_MASTER_CONFIRM: return "CONFIRM";
+    case EDIT_NAME:           return "SERVICE";
+    case EDIT_USERNAME:       return "USERNAME";
+    case EDIT_PASSWORD:       return "PASSWORD";
+    case EDIT_NOTE:           return "NOTE";
+    case EDIT_TOTP:           return "TOTP";
+    case EDIT_SEARCH:         return "SEARCH";
+    default:                  return "EDIT";
+  }
+}
 
-  // Show up to 20 chars, scrolled so cursor is visible.
+bool editorIsHidden() {
+  return editorTarget == EDIT_MASTER ||
+         editorTarget == EDIT_MASTER_CONFIRM ||
+         editorTarget == EDIT_PASSWORD;
+}
+
+void showEditor() {
+  oled.clearBuffer();
+
+  // Header
+  oled.setFont(u8g2_font_5x7_tf);
+  oled.drawStr(0, 8, editorTitle());
+  oled.drawHLine(0, 10, 128);
+
+  // Text line (20 chars, scroll to cursor)
   int viewStart = 0;
   const int VIEW = 20;
   if (editorCursor > VIEW - 1) viewStart = editorCursor - VIEW + 1;
+  if (viewStart < 0) viewStart = 0;
 
   char line[24];
   int n = 0;
+  bool hide = editorIsHidden();
   for (int i = viewStart; i < editorLen && n < VIEW; i++) {
     line[n++] = hide ? '*' : editorBuffer[i];
   }
   line[n] = 0;
-  oled.drawStr(2, 25, line);
-  oled.drawHLine(0, 28, 128);
+  oled.drawStr(0, 19, line);
 
-  // Cursor indicator: position of cursor inside view
+  // Cursor position
   int curView = editorCursor - viewStart;
-  int curX = 2 + curView * 6;
-  if (curX < 0) curX = 0;
-  if (curX > 126) curX = 126;
-  oled.drawBox(curX, 29, 6, 2);
+  if (curView < 0) curView = 0;
+  int curX = curView * 6;
+  if (curX > 122) curX = 122;
+  oled.drawBox(curX, 20, 6, 1);
 
-  // Current char being edited
-  oled.setFont(u8g2_font_7x14B_tf);
-  char c[2];
-  c[0] = CHARSET_GROUPS[editorCharset][editorCharIndex];
-  c[1] = 0;
-  oled.drawStr(4, 47, c);
+  // Keyboard rows
+  oled.setFont(u8g2_font_5x7_tf);
+  const int CELL_W = 12;
+  const int ROW_H = 10;
 
-  oled.setFont(u8g2_font_6x10_tf);
-  char setLine[24];
-  snprintf(setLine, sizeof(setLine), "set: %s", CHARSET_LABELS[editorCharset]);
-  oled.drawStr(28, 46, setLine);
+  for (int r = 0; r < 3; r++) {
+    const char* row = KBD_ROWS[kbdLayout][r];
+    int y = 24 + r * ROW_H;
+    for (int c = 0; c < 10; c++) {
+      int x = c * CELL_W;
+      bool sel = (kbdRow == r && kbdCol == c);
 
-  oled.drawStr(2, 57, "R5/R6 char  R7 add");
-  oled.drawStr(2, 63, "holdR7 next R8 del");
+      if (sel) {
+        oled.drawBox(x, y, CELL_W, ROW_H - 1);
+        oled.setDrawColor(0);
+      }
+      char buf[2] = { row[c] ? row[c] : ' ', 0 };
+      oled.drawStr(x + 3, y + 7, buf);
+      oled.setDrawColor(1);
+    }
+  }
+
+  // Action row
+  int ay = 24 + 3 * ROW_H;
+  // 6 buttons: abc, ABC, 123, #@!, <x, OK
+  int ax_w = 21;  // 6*21 = 126
+  for (int i = 0; i < 6; i++) {
+    int x = i * ax_w;
+    bool sel = (kbdRow == 3 && kbdCol == i);
+    // highlight active layout
+    bool activeLayout = (i < 4 && i == kbdLayout);
+
+    if (sel) {
+      oled.drawBox(x, ay, ax_w - 1, ROW_H - 1);
+      oled.setDrawColor(0);
+    } else if (activeLayout) {
+      oled.drawFrame(x, ay, ax_w - 1, ROW_H - 1);
+    }
+    oled.setFont(u8g2_font_5x7_tf);
+    oled.drawStr(x + 3, ay + 7, KBD_ACTION_LABELS[i]);
+    oled.setDrawColor(1);
+  }
 
   oled.sendBuffer();
 }
 
-void showEditor() {
-  const char* title = "EDIT";
-  bool hide = false;
+// ============================================================
+// EDITOR: RESET / APPLY
+// ============================================================
 
-  switch (editorTarget) {
-    case EDIT_MASTER:         title = "MASTER";   hide = true;  break;
-    case EDIT_MASTER_CONFIRM: title = "REPEAT";   hide = true;  break;
-    case EDIT_NAME:           title = "SERVICE";  hide = false; break;
-    case EDIT_USERNAME:       title = "USERNAME"; hide = false; break;
-    case EDIT_PASSWORD:       title = "PASSWORD"; hide = true;  break;
-    case EDIT_NOTE:           title = "NOTE";     hide = false; break;
-    case EDIT_SEARCH:         title = "SEARCH";   hide = false; break;
-    default: break;
+void resetEditor(EditTarget target, const char* initial = "") {
+  memset(editorBuffer, 0, sizeof(editorBuffer));
+  editorLen = 0;
+  editorCursor = 0;
+  editorTarget = target;
+  kbdLayout = 0;
+  kbdRow = 0;
+  kbdCol = 0;
+
+  if (initial && *initial) {
+    strlcpy(editorBuffer, initial, sizeof(editorBuffer));
+    editorLen = strlen(editorBuffer);
+    editorCursor = editorLen;
   }
-  editorDraw(title, hide);
 }
 
 // ============================================================
@@ -1846,73 +2214,53 @@ void beginEdit(int index) {
   if (index < 0 || index >= vault.count) return;
   editRecordIndex = index;
   editField = 0;
-  resetEditor(EDIT_NAME);
-  strlcpy(editorBuffer, vault.records[index].name, sizeof(editorBuffer));
-  editorLen = strlen(editorBuffer);
-  editorCursor = editorLen;
+  resetEditor(EDIT_NAME, vault.records[index].name);
   currentScreen = SCREEN_EDIT;
 }
 
+void loadFieldIntoEditor(int field) {
+  VaultRecord *r = (editRecordIndex >= 0) ? &vault.records[editRecordIndex] : nullptr;
+  switch (field) {
+    case 0: resetEditor(EDIT_NAME,     r ? r->name     : ""); break;
+    case 1: resetEditor(EDIT_USERNAME, r ? r->username : ""); break;
+    case 2: resetEditor(EDIT_PASSWORD, r ? r->password : ""); break;
+    case 3: resetEditor(EDIT_TOTP,     r ? r->totp     : ""); break;
+    case 4: resetEditor(EDIT_NOTE,     r ? r->note     : ""); break;
+  }
+}
+
 void addOrEditNextField() {
-  if (editRecordIndex >= 0) {
-    VaultRecord &r = vault.records[editRecordIndex];
-    switch (editField) {
-      case 0: strlcpy(r.name,     editorBuffer, MAX_NAME); break;
-      case 1: strlcpy(r.username, editorBuffer, MAX_USER); break;
-      case 2: strlcpy(r.password, editorBuffer, MAX_PASS); break;
-      case 3: strlcpy(r.note,     editorBuffer, MAX_NOTE); break;
-    }
-  } else {
-    if (editField == 0) {
-      memset(&vault.records[vault.count], 0, sizeof(VaultRecord));
-      vault.records[vault.count].type = RECORD_PASSWORD;
-      strlcpy(vault.records[vault.count].name, editorBuffer, MAX_NAME);
-    } else {
-      VaultRecord &r = vault.records[vault.count];
-      switch (editField) {
-        case 1: strlcpy(r.username, editorBuffer, MAX_USER); break;
-        case 2: strlcpy(r.password, editorBuffer, MAX_PASS); break;
-        case 3: strlcpy(r.note,     editorBuffer, MAX_NOTE); break;
-      }
-    }
+  // Save current field into record
+  VaultRecord &r = vault.records[(editRecordIndex >= 0) ? editRecordIndex : vault.count];
+  if (editRecordIndex < 0 && editField == 0) {
+    memset(&vault.records[vault.count], 0, sizeof(VaultRecord));
+    vault.records[vault.count].type = RECORD_PASSWORD;
+  }
+
+  switch (editField) {
+    case 0: strlcpy(r.name,     editorBuffer, MAX_NAME); break;
+    case 1: strlcpy(r.username, editorBuffer, MAX_USER); break;
+    case 2: strlcpy(r.password, editorBuffer, MAX_PASS); break;
+    case 3: strlcpy(r.totp,     editorBuffer, MAX_TOTP); break;
+    case 4: strlcpy(r.note,     editorBuffer, MAX_NOTE); break;
   }
 
   editField++;
-  if (editField >= 4) {
+
+  if (editField >= 5) {
     if (editRecordIndex < 0) {
       vault.count++;
-      if (!saveCurrentVault()) { vault.count--; return; }
+      if (!saveCurrentVault()) {
+        vault.count--;
+        return;
+      }
     } else {
       if (!saveCurrentVault()) return;
     }
     currentScreen = SCREEN_HOME;
     return;
   }
-
-  switch (editField) {
-    case 0:
-      resetEditor(EDIT_NAME);
-      if (editRecordIndex >= 0)
-        strlcpy(editorBuffer, vault.records[editRecordIndex].name, sizeof(editorBuffer));
-      break;
-    case 1:
-      resetEditor(EDIT_USERNAME);
-      if (editRecordIndex >= 0)
-        strlcpy(editorBuffer, vault.records[editRecordIndex].username, sizeof(editorBuffer));
-      break;
-    case 2:
-      resetEditor(EDIT_PASSWORD);
-      if (editRecordIndex >= 0)
-        strlcpy(editorBuffer, vault.records[editRecordIndex].password, sizeof(editorBuffer));
-      break;
-    case 3:
-      resetEditor(EDIT_NOTE);
-      if (editRecordIndex >= 0)
-        strlcpy(editorBuffer, vault.records[editRecordIndex].note, sizeof(editorBuffer));
-      break;
-  }
-  editorLen = strlen(editorBuffer);
-  editorCursor = editorLen;
+  loadFieldIntoEditor(editField);
 }
 
 // ============================================================
@@ -1921,10 +2269,11 @@ void addOrEditNextField() {
 
 void showList() {
   oled.clearBuffer();
-  header(searchCount ? "SEARCH" : "PASSWORDS");
   oled.setFont(u8g2_font_6x10_tf);
-  int count = searchCount ? searchCount : vault.count;
+  oled.drawStr(0, 9, searchCount ? "SEARCH" : "PASSWORDS");
+  oled.drawHLine(0, 12, 128);
 
+  int count = searchCount ? searchCount : vault.count;
   if (!count) {
     oled.drawStr(34, 35, "NO RECORDS");
     oled.drawStr(44, 53, "R8 BACK");
@@ -1940,11 +2289,12 @@ void showList() {
     int idx = first + i;
     if (idx >= count) break;
     int actual = searchCount ? searchResults[idx] : idx;
+    int y = 24 + i * 10;
     if (idx == selectedRecord) {
-      oled.drawBox(0, 16 + i * 11, 128, 11);
+      oled.drawBox(0, y - 8, 128, 10);
       oled.setDrawColor(0);
     }
-    oled.drawStr(3, 25 + i * 11, vault.records[actual].name);
+    oled.drawStr(3, y, vault.records[actual].name);
     oled.setDrawColor(1);
   }
   oled.sendBuffer();
@@ -1955,29 +2305,50 @@ void showRecord() {
     currentScreen = SCREEN_LIST; return;
   }
   VaultRecord &r = vault.records[selectedRecord];
+
   oled.clearBuffer();
-  header(String(r.name));
   oled.setFont(u8g2_font_6x10_tf);
+  // Truncate name to header
+  char title[22];
+  strlcpy(title, r.name, sizeof(title));
+  oled.drawStr(0, 9, title);
+  oled.drawHLine(0, 12, 128);
 
-  oled.drawStr(2, 25, "USER:");
-  char u[20];
+  oled.setFont(u8g2_font_5x7_tf);
+  oled.drawStr(0, 22, "USER");
+  char u[22];
   strlcpy(u, r.username, sizeof(u));
-  oled.drawStr(35, 25, u);
+  oled.drawStr(0, 30, u);
 
-  oled.drawStr(2, 37, "PASS:");
-  char p[20];
+  oled.drawStr(0, 41, "PASS");
+  char p[22];
   if (recordPasswordVisible) {
     strlcpy(p, r.password, sizeof(p));
   } else {
     int n = strlen(r.password);
-    if (n > 18) n = 18;
+    if (n > 20) n = 20;
     for (int i = 0; i < n; i++) p[i] = '*';
     p[n] = 0;
   }
-  oled.drawStr(35, 37, p);
+  oled.drawStr(0, 49, p);
 
-  oled.drawStr(2, 51, "R7 SHOW/HIDE");
-  oled.drawStr(82, 62, "R8 BACK");
+  if (strlen(r.totp)) {
+    time_t now = time(nullptr);
+    char code[8] = "------";
+    if (now > 1600000000) {
+      uint32_t t = (uint32_t)(now / 30);
+      if (!totpGenerate(r.totp, t, code)) strlcpy(code, "------", sizeof(code));
+    }
+    oled.setFont(u8g2_font_6x10_tf);
+    oled.drawStr(78, 30, "2FA");
+    oled.setFont(u8g2_font_7x14B_tf);
+    oled.drawStr(78, 48, code);
+  }
+
+  oled.setFont(u8g2_font_5x7_tf);
+  oled.drawStr(0, 63, "R7 show  holdR7 edit");
+  oled.drawStr(95, 63, "R8 back");
+
   oled.sendBuffer();
 }
 
@@ -1987,22 +2358,23 @@ void showRecord() {
 
 void showGenerator() {
   oled.clearBuffer();
-  header("GENERATOR");
-  oled.setFont(u8g2_font_6x10_tf);
+  drawHeader("GENERATOR");
+  oled.setFont(u8g2_font_5x7_tf);
 
-  char l1[24], l2[24];
+  char l1[22], l2[22];
   strlcpy(l1, generatedPassword, sizeof(l1));
-  oled.drawStr(2, 27, l1);
+  oled.drawStr(0, 22, l1);
   if (strlen(generatedPassword) > 20) {
     strlcpy(l2, generatedPassword + 20, sizeof(l2));
-    oled.drawStr(2, 39, l2);
+    oled.drawStr(0, 30, l2);
   }
 
   char st[24];
   snprintf(st, sizeof(st), "LEN %d  %s",
            generatorLength, generatorLabels[generatorMode]);
-  oled.drawStr(2, 51, st);
-  oled.drawStr(2, 62, "R5/R6 len R7 new");
+  oled.drawStr(0, 45, st);
+  oled.drawStr(0, 57, "R5/R6 len  R7 new");
+  oled.drawStr(0, 63, "holdR7 mode R8 back");
   oled.sendBuffer();
 }
 
@@ -2010,10 +2382,10 @@ void showGenerator() {
 // SETTINGS SCREEN
 // ============================================================
 
-const char* settingsItems[] = {"CHANGE MASTER", "AUTO LOCK", "LOCK"};
+const char* settingsItems[] = {"CHANGE MASTER", "AUTO LOCK", "INFO", "LOCK"};
 
 void showSettings() {
-  drawMenu("SETTINGS", settingsItems, 3, menuIndex);
+  drawMenu("SETTINGS", settingsItems, 4, menuIndex);
 }
 
 // ============================================================
@@ -2034,7 +2406,6 @@ void handleChangeMasterEnter() {
   }
   if (editorTarget == EDIT_MASTER_CONFIRM) {
     if (strcmp(confirmMasterBuffer, editorBuffer) != 0) {
-      // mismatch — restart
       memset(confirmMasterBuffer, 0, sizeof(confirmMasterBuffer));
       resetEditor(EDIT_MASTER);
       return;
@@ -2078,8 +2449,7 @@ void buildSearchResults() {
 // ============================================================
 
 const char* homeItems[] = {
-  "PASSWORDS", "SEARCH", "ADD PASSWORD",
-  "GENERATOR", "SETTINGS", "LOCK"
+  "PASSWORDS", "SEARCH", "ADD", "GENERATOR", "SETTINGS", "LOCK"
 };
 
 void showHome() {
@@ -2092,13 +2462,15 @@ void showHome() {
 
 void showSetup() {
   oled.clearBuffer();
-  header("SETUP");
-  oled.setFont(u8g2_font_6x10_tf);
-  oled.drawStr(2, 24, "WiFi:");
-  oled.drawStr(2, 35, apSsid.c_str());
-  oled.drawStr(2, 46, "PASS:");
-  oled.drawStr(35, 46, config.apPassword);
-  oled.drawStr(16, 59, "192.168.4.1");
+  drawHeader("SETUP");
+
+  oled.setFont(u8g2_font_5x7_tf);
+  oled.drawStr(0, 22, "Open web UI:");
+  oled.drawStr(0, 31, "http://192.168.4.1");
+  oled.drawStr(0, 42, "Wi-Fi SSID");
+  oled.drawStr(0, 50, apSsid.c_str());
+  oled.drawStr(0, 61, "Pass: ");
+  oled.drawStr(30, 61, config.apPassword);
   oled.sendBuffer();
 }
 
@@ -2108,40 +2480,70 @@ void showSetup() {
 
 void handleEditorButtons(ButtonEvent up, ButtonEvent down,
                          ButtonEvent enter, ButtonEvent back) {
-  const char* set = CHARSET_GROUPS[editorCharset];
-  int setLen = strlen(set);
+  // Left / right navigation
+  if (up == BTN_SHORT) {
+    if (kbdRow < 3) {
+      if (kbdCol > 0) kbdCol--;
+    } else {
+      if (kbdCol > 0) kbdCol--;
+    }
+    kbdClampCursor();
+  }
+  if (down == BTN_SHORT) {
+    if (kbdRow < 3) {
+      int len = strlen(KBD_ROWS[kbdLayout][kbdRow]);
+      if (kbdCol < len - 1) kbdCol++;
+    } else {
+      if (kbdCol < 5) kbdCol++;
+    }
+    kbdClampCursor();
+  }
 
-  // Character wheel: R5=prev, R6=next
-  if (up == BTN_SHORT)
-    editorCharIndex = (editorCharIndex - 1 + setLen) % setLen;
-  if (down == BTN_SHORT)
-    editorCharIndex = (editorCharIndex + 1) % setLen;
-
-  // Charset switch: long press
+  // Charset quick switch (long press R5/R6)
   if (up == BTN_LONG) {
-    editorCharset = (editorCharset - 1 + 4) % 4;
-    editorCharIndex = 0;
+    kbdLayout = (kbdLayout + 3) % 4;
+    kbdClampCursor();
   }
   if (down == BTN_LONG) {
-    editorCharset = (editorCharset + 1) % 4;
-    editorCharIndex = 0;
+    kbdLayout = (kbdLayout + 1) % 4;
+    kbdClampCursor();
   }
 
-  // Insert char: R7 short
-  if (enter == BTN_SHORT)
-    editorInsertChar(CHARSET_GROUPS[editorCharset][editorCharIndex]);
+  // INSERT / ACTION on R7 short
+  if (enter == BTN_SHORT) {
+    if (kbdRow < 3) {
+      char c = kbdCurrentChar();
+      if (c) editorInsertChar(c);
+    } else {
+      // action row
+      switch (kbdCol) {
+        case 0: kbdLayout = 0; break;
+        case 1: kbdLayout = 1; break;
+        case 2: kbdLayout = 2; break;
+        case 3: kbdLayout = 3; break;
+        case 4: editorDeleteChar(); break;
+        case 5: /* accept — handled by caller via long? no, we do it here */
+          // simulate accept: caller checks after
+          break;
+      }
+      kbdClampCursor();
+    }
+  }
 
-  // Delete char: R8 short
-  if (back == BTN_SHORT)
-    editorDeleteChar();
+  // Backspace on R8 short
+  if (back == BTN_SHORT) editorDeleteChar();
 
-  // R7 long = accept (handled by caller)
-  // R8 long = cancel (handled by caller)
+  // R7 long = accept, R8 long = cancel — handled by caller
 }
 
 // ============================================================
 // BUTTON MAIN
 // ============================================================
+
+// Returns true if accepted
+bool editorAcceptRequested(ButtonEvent enter) {
+  return enter == BTN_LONG;
+}
 
 void handleButtons() {
   ButtonEvent up    = pollButton(PIN_R5, bR5);
@@ -2159,18 +2561,30 @@ void handleButtons() {
     if (enter == BTN_SHORT && millis() >= lockoutUntil) {
       resetEditor(EDIT_MASTER);
       currentScreen = SCREEN_UNLOCK;
+    } else if (up == BTN_SHORT) {
+      currentScreen = SCREEN_INFO;
     }
+    return;
+  }
+
+  // ---------------- INFO ----------------
+  if (currentScreen == SCREEN_INFO) {
+    if (back == BTN_SHORT || enter == BTN_SHORT)
+      currentScreen = SCREEN_LOCKED;
     return;
   }
 
   // ---------------- UNLOCK ----------------
   if (currentScreen == SCREEN_UNLOCK) {
     handleEditorButtons(up, down, enter, back);
-    if (enter == BTN_LONG) {
+
+    // Accept when R7 long OR action "OK" pressed (R7 short on col 5)
+    bool okPressed = (enter == BTN_LONG) ||
+                     (enter == BTN_SHORT && kbdRow == 3 && kbdCol == 5);
+    if (okPressed) {
       UnlockResult r = attemptUnlock(editorBuffer, editorLen);
       memset(editorBuffer, 0, sizeof(editorBuffer));
-      editorLen = 0;
-      editorCursor = 0;
+      editorLen = 0; editorCursor = 0;
       if (r.ok) {
         currentScreen = SCREEN_HOME;
         menuIndex = 0;
@@ -2189,7 +2603,9 @@ void handleButtons() {
   // ---------------- ADD / EDIT ----------------
   if (currentScreen == SCREEN_ADD || currentScreen == SCREEN_EDIT) {
     handleEditorButtons(up, down, enter, back);
-    if (enter == BTN_LONG) addOrEditNextField();
+    bool okPressed = (enter == BTN_LONG) ||
+                     (enter == BTN_SHORT && kbdRow == 3 && kbdCol == 5);
+    if (okPressed) addOrEditNextField();
     if (back == BTN_LONG) {
       memset(editorBuffer, 0, sizeof(editorBuffer));
       editorLen = 0; editorCursor = 0;
@@ -2201,23 +2617,25 @@ void handleButtons() {
   // ---------------- SEARCH ----------------
   if (currentScreen == SCREEN_SEARCH) {
     handleEditorButtons(up, down, enter, back);
-    if (enter == BTN_LONG) {
+    bool okPressed = (enter == BTN_LONG) ||
+                     (enter == BTN_SHORT && kbdRow == 3 && kbdCol == 5);
+    if (okPressed) {
       memset(searchBuffer, 0, sizeof(searchBuffer));
       memcpy(searchBuffer, editorBuffer, editorLen);
       searchBuffer[editorLen] = 0;
       buildSearchResults();
       currentScreen = SCREEN_LIST;
     }
-    if (back == BTN_LONG) {
-      currentScreen = SCREEN_HOME;
-    }
+    if (back == BTN_LONG) currentScreen = SCREEN_HOME;
     return;
   }
 
   // ---------------- CHANGE MASTER ----------------
   if (currentScreen == SCREEN_CHANGE_MASTER) {
     handleEditorButtons(up, down, enter, back);
-    if (enter == BTN_LONG) handleChangeMasterEnter();
+    bool okPressed = (enter == BTN_LONG) ||
+                     (enter == BTN_SHORT && kbdRow == 3 && kbdCol == 5);
+    if (okPressed) handleChangeMasterEnter();
     if (back == BTN_LONG) {
       memset(confirmMasterBuffer, 0, sizeof(confirmMasterBuffer));
       resetEditor(EDIT_NONE);
@@ -2283,17 +2701,19 @@ void handleButtons() {
   // ---------------- SETTINGS ----------------
   if (currentScreen == SCREEN_SETTINGS) {
     if (up == BTN_SHORT && menuIndex > 0) menuIndex--;
-    else if (down == BTN_SHORT && menuIndex < 2) menuIndex++;
+    else if (down == BTN_SHORT && menuIndex < 3) menuIndex++;
     else if (enter == BTN_SHORT) {
       switch (menuIndex) {
         case 0: startChangeMaster(); break;
         case 1:
           if (config.autoLockSeconds == 60) config.autoLockSeconds = 120;
           else if (config.autoLockSeconds == 120) config.autoLockSeconds = 300;
-          else config.autoLockSeconds = 60;
+          else if (config.autoLockSeconds == 300) config.autoLockSeconds = 60;
+          else config.autoLockSeconds = 300;
           saveConfig();
           break;
-        case 2: lockVault(); break;
+        case 2: currentScreen = SCREEN_INFO; break;
+        case 3: lockVault(); break;
       }
     } else if (back == BTN_SHORT) {
       currentScreen = SCREEN_HOME;
@@ -2311,7 +2731,7 @@ void setup() {
   delay(400);
   Serial.println();
   Serial.println("======================");
-  Serial.println("VAULT OS 0.7");
+  Serial.println("VAULT OS 0.8");
   Serial.println("======================");
 
   Wire.begin(PIN_SDA, PIN_SCL);
@@ -2350,6 +2770,10 @@ void setup() {
   startWiFi();
   startWebServer();
 
+  // NTP for TOTP
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.println("[NTP] configured");
+
   if (LittleFS.exists(VAULT_FILE)) {
     currentScreen = SCREEN_LOCKED;
     showLocked();
@@ -2363,6 +2787,8 @@ void setup() {
 // LOOP
 // ============================================================
 
+unsigned long lastTotpTick = 0;
+
 void loop() {
   server.handleClient();
 
@@ -2374,9 +2800,18 @@ void loop() {
 
   handleButtons();
 
+  // Refresh TOTP once per second when on record screen
+  if (currentScreen == SCREEN_RECORD && millis() - lastTotpTick > 1000) {
+    lastTotpTick = millis();
+    if (selectedRecord >= 0 && selectedRecord < vault.count) {
+      totpRefresh(vault.records[selectedRecord].totp);
+    }
+  }
+
   switch (currentScreen) {
     case SCREEN_SETUP:         showSetup();         break;
     case SCREEN_LOCKED:        showLocked();        break;
+    case SCREEN_INFO:          showInfo();          break;
     case SCREEN_UNLOCK:        showEditor();        break;
     case SCREEN_HOME:          showHome();          break;
     case SCREEN_LIST:          showList();          break;
